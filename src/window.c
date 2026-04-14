@@ -1,0 +1,808 @@
+#define _GNU_SOURCE
+#include <adwaita.h>
+#include "window.h"
+#include "actions.h"
+#include <glib/gstdio.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+
+/* Custom CSS themes */
+typedef struct {
+    const char *name;
+    const char *fg;
+    const char *bg;
+    const char *css;
+} ThemeDef;
+
+static const ThemeDef custom_themes[] = {
+    {"solarized-light", "#657b83", "#fdf6e3",
+     "textview text { background-color: #fdf6e3; color: #657b83; }"
+     "textview { background-color: #fdf6e3; }"},
+    {"solarized-dark", "#839496", "#002b36",
+     "textview text { background-color: #002b36; color: #839496; }"
+     "textview { background-color: #002b36; }"},
+    {"monokai", "#f8f8f2", "#272822",
+     "textview text { background-color: #272822; color: #f8f8f2; }"
+     "textview { background-color: #272822; }"},
+    {"gruvbox-light", "#3c3836", "#fbf1c7",
+     "textview text { background-color: #fbf1c7; color: #3c3836; }"
+     "textview { background-color: #fbf1c7; }"},
+    {"gruvbox-dark", "#ebdbb2", "#282828",
+     "textview text { background-color: #282828; color: #ebdbb2; }"
+     "textview { background-color: #282828; }"},
+    {"nord", "#d8dee9", "#2e3440",
+     "textview text { background-color: #2e3440; color: #d8dee9; }"
+     "textview { background-color: #2e3440; }"},
+    {"dracula", "#f8f8f2", "#282a36",
+     "textview text { background-color: #282a36; color: #f8f8f2; }"
+     "textview { background-color: #282a36; }"},
+    {"tokyo-night", "#a9b1d6", "#1a1b26",
+     "textview text { background-color: #1a1b26; color: #a9b1d6; }"
+     "textview { background-color: #1a1b26; }"},
+    {"catppuccin-latte", "#4c4f69", "#eff1f5",
+     "textview text { background-color: #eff1f5; color: #4c4f69; }"
+     "textview { background-color: #eff1f5; }"},
+    {"catppuccin-mocha", "#cdd6f4", "#1e1e2e",
+     "textview text { background-color: #1e1e2e; color: #cdd6f4; }"
+     "textview { background-color: #1e1e2e; }"},
+    {NULL, NULL, NULL, NULL}
+};
+
+static gboolean is_dark_theme(const char *theme);
+
+/*
+ * Highlight current line: overlay approach (like VS Code, Sublime).
+ */
+
+#define NOTES_TYPE_TEXT_VIEW (notes_text_view_get_type())
+G_DECLARE_FINAL_TYPE(NotesTextView, notes_text_view, NOTES, TEXT_VIEW, GtkTextView)
+
+struct _NotesTextView {
+    GtkTextView parent;
+    NotesWindow *win;
+};
+
+G_DEFINE_TYPE(NotesTextView, notes_text_view, GTK_TYPE_TEXT_VIEW)
+
+static void notes_text_view_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) {
+    NotesTextView *self = NOTES_TEXT_VIEW(widget);
+    NotesWindow *win = self->win;
+
+    GTK_WIDGET_CLASS(notes_text_view_parent_class)->snapshot(widget, snapshot);
+
+    if (win && win->settings.highlight_current_line) {
+        GtkTextIter iter;
+        gtk_text_buffer_get_iter_at_line(win->buffer, &iter, win->highlight_line);
+
+        int buf_y, line_height;
+        gtk_text_view_get_line_yrange(GTK_TEXT_VIEW(widget), &iter,
+                                      &buf_y, &line_height);
+
+        int wx, wy;
+        gtk_text_view_buffer_to_window_coords(GTK_TEXT_VIEW(widget),
+            GTK_TEXT_WINDOW_WIDGET, 0, buf_y, &wx, &wy);
+
+        int view_width = gtk_widget_get_width(widget);
+        int h = line_height > 0 ? line_height : win->settings.font_size + 4;
+        int extra = (int)((win->settings.line_spacing - 1.0) * win->settings.font_size * 0.5);
+        if (extra < 0) extra = 0;
+
+        graphene_rect_t area = GRAPHENE_RECT_INIT(0, wy - extra, view_width, h + extra * 2);
+        gtk_snapshot_append_color(snapshot, &win->highlight_rgba, &area);
+    }
+}
+
+static void notes_text_view_class_init(NotesTextViewClass *klass) {
+    GTK_WIDGET_CLASS(klass)->snapshot = notes_text_view_snapshot;
+}
+
+static void notes_text_view_init(NotesTextView *self) {
+    (void)self;
+}
+
+static void update_line_highlights(NotesWindow *win) {
+    GtkTextMark *mark = gtk_text_buffer_get_insert(win->buffer);
+    GtkTextIter cursor;
+    gtk_text_buffer_get_iter_at_mark(win->buffer, &cursor, mark);
+    win->highlight_line = gtk_text_iter_get_line(&cursor);
+    gtk_widget_queue_draw(GTK_WIDGET(win->text_view));
+}
+
+static void apply_highlight_color(NotesWindow *win) {
+    gboolean dark = is_dark_theme(win->settings.theme);
+    if (dark) {
+        win->highlight_rgba = (GdkRGBA){1.0, 1.0, 1.0, 0.06};
+    } else {
+        win->highlight_rgba = (GdkRGBA){0.0, 0.0, 0.0, 0.06};
+    }
+}
+
+/* Escape a string for safe CSS embedding: strip } ; { and quotes */
+static void css_escape_font(char *out, size_t out_sz, const char *in) {
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j < out_sz - 1; i++) {
+        char c = in[i];
+        if (c == '}' || c == '{' || c == ';' || c == '"' || c == '\'' || c == '\\')
+            continue;
+        out[j++] = c;
+    }
+    out[j] = '\0';
+}
+
+static void apply_css(NotesWindow *win) {
+    char css[4096];
+
+    /* Escape font names to prevent CSS injection */
+    char safe_font[256], safe_gui_font[256];
+    css_escape_font(safe_font, sizeof(safe_font), win->settings.font);
+    css_escape_font(safe_gui_font, sizeof(safe_gui_font), win->settings.gui_font);
+
+    const ThemeDef *td = NULL;
+    for (int i = 0; custom_themes[i].name; i++) {
+        if (strcmp(win->settings.theme, custom_themes[i].name) == 0) {
+            td = &custom_themes[i];
+            break;
+        }
+    }
+
+    if (td) {
+        const char *bg = td->bg;
+        const char *fg = td->fg;
+
+        snprintf(css, sizeof(css),
+            "textview { font-family: %s; font-size: %dpt; background-color: %s; }"
+            "textview text { background-color: %s; color: %s; }"
+            ".line-numbers, .line-numbers text {"
+            "  background-color: %s; color: alpha(%s, 0.3); }"
+            ".titlebar, headerbar {"
+            "  background: %s; color: %s; box-shadow: none; }"
+            "headerbar button, headerbar menubutton button,"
+            "headerbar menubutton { color: %s; background: transparent; }"
+            "headerbar button:hover, headerbar menubutton button:hover {"
+            "  background: alpha(%s, 0.1); }"
+            ".statusbar { font-size: 10pt; padding: 2px 4px;"
+            "  color: alpha(%s, 0.6); background-color: %s; }"
+            "window, window.background { background-color: %s; }"
+            "popover, popover.menu {"
+            "  background: transparent; box-shadow: none; border: none; }"
+            "popover > contents, popover.menu > contents {"
+            "  background-color: %s; color: %s;"
+            "  border-radius: 12px; border: none; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }"
+            "popover > arrow, popover.menu > arrow { background: transparent; border: none; }"
+            "popover modelbutton { color: %s; }"
+            "popover modelbutton:hover { background-color: alpha(%s, 0.15); }"
+            "windowcontrols button { color: %s; }",
+            safe_font, win->settings.font_size, bg,
+            bg, fg,
+            bg, fg,
+            bg, fg,
+            fg,
+            fg,
+            fg, bg,
+            bg,
+            bg, fg,
+            fg,
+            fg,
+            fg);
+    } else {
+        const char *bg, *fg;
+        if (is_dark_theme(win->settings.theme)) {
+            bg = "#1e1e1e"; fg = "#d4d4d4";
+        } else {
+            bg = "#ffffff"; fg = "#1e1e1e";
+        }
+
+        snprintf(css, sizeof(css),
+            "textview { font-family: %s; font-size: %dpt; background-color: %s; }"
+            "textview text { background-color: %s; color: %s; }"
+            ".line-numbers, .line-numbers text {"
+            "  background-color: %s; color: alpha(%s, 0.3); }"
+            ".statusbar { font-size: 10pt; padding: 2px 4px; opacity: 0.7; }",
+            safe_font, win->settings.font_size, bg,
+            bg, fg,
+            bg, fg);
+    }
+
+    /* Append GUI font rule */
+    char gui_css[512];
+    snprintf(gui_css, sizeof(gui_css),
+        "headerbar, headerbar button, headerbar label,"
+        "popover, popover.menu, popover label, popover button,"
+        ".statusbar, .statusbar label {"
+        "  font-family: %s; font-size: %dpt; }",
+        safe_gui_font, win->settings.gui_font_size);
+    strncat(css, gui_css, sizeof(css) - strlen(css) - 1);
+
+    gtk_css_provider_load_from_string(win->css_provider, css);
+}
+
+static gboolean is_dark_theme(const char *theme) {
+    return strcmp(theme, "dark") == 0 ||
+           strcmp(theme, "solarized-dark") == 0 ||
+           strcmp(theme, "monokai") == 0 ||
+           strcmp(theme, "gruvbox-dark") == 0 ||
+           strcmp(theme, "nord") == 0 ||
+           strcmp(theme, "dracula") == 0 ||
+           strcmp(theme, "tokyo-night") == 0 ||
+           strcmp(theme, "catppuccin-mocha") == 0;
+}
+
+static void apply_theme(NotesWindow *win) {
+    AdwStyleManager *sm = adw_style_manager_get_default();
+    gboolean dark = is_dark_theme(win->settings.theme);
+
+    for (int i = 0; custom_themes[i].name; i++) {
+        if (strcmp(win->settings.theme, custom_themes[i].name) == 0) {
+            GdkRGBA c;
+            gdk_rgba_parse(&c, custom_themes[i].bg);
+            dark = (0.299 * c.red + 0.587 * c.green + 0.114 * c.blue) < 0.5;
+            break;
+        }
+    }
+
+    if (strcmp(win->settings.theme, "system") == 0)
+        adw_style_manager_set_color_scheme(sm, ADW_COLOR_SCHEME_DEFAULT);
+    else if (dark)
+        adw_style_manager_set_color_scheme(sm, ADW_COLOR_SCHEME_FORCE_DARK);
+    else
+        adw_style_manager_set_color_scheme(sm, ADW_COLOR_SCHEME_FORCE_LIGHT);
+}
+
+/* Line numbers */
+static void update_line_numbers(GtkTextBuffer *buffer, NotesWindow *win);
+
+static void update_cursor_position(NotesWindow *win) {
+    GtkTextIter iter;
+    GtkTextMark *mark = gtk_text_buffer_get_insert(win->buffer);
+    gtk_text_buffer_get_iter_at_mark(win->buffer, &iter, mark);
+    int line = gtk_text_iter_get_line(&iter) + 1;
+    int col = gtk_text_iter_get_line_offset(&iter) + 1;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Ln %d, Col %d", line, col);
+    gtk_label_set_text(win->status_cursor, buf);
+}
+
+static void apply_font_intensity(NotesWindow *win);
+
+static gboolean scroll_idle_cb(gpointer data) {
+    NotesWindow *win = data;
+    win->scroll_idle_id = 0;
+    GtkTextMark *insert = gtk_text_buffer_get_insert(win->buffer);
+    gtk_text_view_scroll_to_mark(win->text_view, insert, 0.05, FALSE, 0, 0);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean intensity_idle_cb(gpointer data) {
+    NotesWindow *win = data;
+    win->intensity_idle_id = 0;
+    if (win->settings.font_intensity < 0.99)
+        apply_font_intensity(win);
+    return G_SOURCE_REMOVE;
+}
+
+static void update_dirty_state(NotesWindow *win) {
+    if (!win->dirty) {
+        win->dirty = TRUE;
+        /* Show filename with dirty marker */
+        if (win->current_file[0]) {
+            char *base = g_path_get_basename(win->current_file);
+            char title[256];
+            snprintf(title, sizeof(title), "%s *", base);
+            gtk_window_set_title(GTK_WINDOW(win->window), title);
+            g_free(base);
+        } else {
+            gtk_window_set_title(GTK_WINDOW(win->window), "Notes Light *");
+        }
+    }
+}
+
+static void on_buffer_changed(GtkTextBuffer *buffer, gpointer data) {
+    NotesWindow *win = data;
+    update_dirty_state(win);
+    if (win->settings.show_line_numbers)
+        update_line_numbers(buffer, win);
+    update_cursor_position(win);
+    update_line_highlights(win);
+    if (win->settings.font_intensity < 0.99 && win->intensity_idle_id == 0)
+        win->intensity_idle_id = g_idle_add(intensity_idle_cb, win);
+    if (win->scroll_idle_id == 0)
+        win->scroll_idle_id = g_idle_add(scroll_idle_cb, win);
+}
+
+static void on_cursor_moved(GtkTextBuffer *buffer, GParamSpec *pspec, gpointer data) {
+    (void)buffer; (void)pspec;
+    NotesWindow *win = data;
+    update_cursor_position(win);
+    update_line_highlights(win);
+}
+
+static void draw_line_numbers(GtkDrawingArea *area, cairo_t *cr,
+                              int width, int height, gpointer data) {
+    (void)area; (void)height;
+    NotesWindow *win = data;
+    if (!win->settings.show_line_numbers) return;
+
+    PangoFontDescription *fd = pango_font_description_new();
+    pango_font_description_set_family(fd, win->settings.font);
+    pango_font_description_set_size(fd, win->settings.font_size * PANGO_SCALE);
+
+    PangoLayout *layout = pango_cairo_create_layout(cr);
+    pango_layout_set_font_description(layout, fd);
+    pango_layout_set_alignment(layout, PANGO_ALIGN_RIGHT);
+    pango_layout_set_width(layout, (width - 12) * PANGO_SCALE);
+
+    GdkRGBA color;
+    const char *theme_fg = NULL;
+    for (int t = 0; custom_themes[t].name; t++) {
+        if (strcmp(win->settings.theme, custom_themes[t].name) == 0) {
+            theme_fg = custom_themes[t].fg;
+            break;
+        }
+    }
+    if (theme_fg) {
+        gdk_rgba_parse(&color, theme_fg);
+    } else if (is_dark_theme(win->settings.theme)) {
+        color = (GdkRGBA){0.85, 0.85, 0.85, 1.0};
+    } else {
+        color = (GdkRGBA){0.12, 0.12, 0.12, 1.0};
+    }
+    cairo_set_source_rgba(cr, color.red, color.green, color.blue, 0.3);
+
+    GdkRectangle visible;
+    gtk_text_view_get_visible_rect(win->text_view, &visible);
+
+    GtkTextIter iter;
+    gtk_text_view_get_iter_at_location(win->text_view, &iter,
+                                       visible.x, visible.y);
+    gtk_text_iter_set_line_offset(&iter, 0);
+
+    while (TRUE) {
+        int buf_y, line_height;
+        gtk_text_view_get_line_yrange(win->text_view, &iter, &buf_y, &line_height);
+
+        if (buf_y > visible.y + visible.height) break;
+
+        int win_x, win_y;
+        gtk_text_view_buffer_to_window_coords(win->text_view,
+            GTK_TEXT_WINDOW_WIDGET, 0, buf_y, &win_x, &win_y);
+
+        char num[16];
+        snprintf(num, sizeof(num), "%d", gtk_text_iter_get_line(&iter) + 1);
+        pango_layout_set_text(layout, num, -1);
+        cairo_move_to(cr, 4, win_y);
+        pango_cairo_show_layout(cr, layout);
+
+        if (!gtk_text_iter_forward_line(&iter)) break;
+    }
+
+    g_object_unref(layout);
+    pango_font_description_free(fd);
+}
+
+static gboolean line_numbers_idle_cb(gpointer data) {
+    NotesWindow *win = data;
+    win->line_numbers_idle_id = 0;
+    if (!win->settings.show_line_numbers) return G_SOURCE_REMOVE;
+
+    int lines = gtk_text_buffer_get_line_count(win->buffer);
+
+    int digits = 1, n = lines;
+    while (n >= 10) { digits++; n /= 10; }
+    if (digits < 2) digits = 2;
+
+    char sample[16];
+    memset(sample, '9', (size_t)digits);
+    sample[digits] = '\0';
+
+    PangoLayout *layout = gtk_widget_create_pango_layout(GTK_WIDGET(win->line_numbers), sample);
+    PangoFontDescription *fd = pango_font_description_new();
+    pango_font_description_set_family(fd, win->settings.font);
+    pango_font_description_set_size(fd, win->settings.font_size * PANGO_SCALE);
+    pango_layout_set_font_description(layout, fd);
+    int pw, ph;
+    pango_layout_get_pixel_size(layout, &pw, &ph);
+    (void)ph;
+    pango_font_description_free(fd);
+    g_object_unref(layout);
+
+    int width = pw + 12;
+    gtk_widget_set_size_request(GTK_WIDGET(win->line_numbers), width, -1);
+
+    gtk_widget_queue_draw(GTK_WIDGET(win->line_numbers));
+    return G_SOURCE_REMOVE;
+}
+
+static void update_line_numbers(GtkTextBuffer *buffer, NotesWindow *win) {
+    (void)buffer;
+    if (!win->settings.show_line_numbers) return;
+    if (win->line_numbers_idle_id == 0)
+        win->line_numbers_idle_id = g_idle_add(line_numbers_idle_cb, win);
+}
+
+static void apply_font_intensity(NotesWindow *win) {
+    double alpha = win->settings.font_intensity;
+
+    if (alpha >= 0.99) {
+        GtkTextIter start, end;
+        gtk_text_buffer_get_bounds(win->buffer, &start, &end);
+        gtk_text_buffer_remove_tag(win->buffer, win->intensity_tag, &start, &end);
+        return;
+    }
+
+    const char *fg = NULL;
+    for (int i = 0; custom_themes[i].name; i++) {
+        if (strcmp(win->settings.theme, custom_themes[i].name) == 0) {
+            fg = custom_themes[i].fg;
+            break;
+        }
+    }
+
+    GdkRGBA color;
+    if (fg) {
+        gdk_rgba_parse(&color, fg);
+    } else if (is_dark_theme(win->settings.theme)) {
+        color = (GdkRGBA){1.0, 1.0, 1.0, 1.0};
+    } else {
+        color = (GdkRGBA){0.0, 0.0, 0.0, 1.0};
+    }
+    color.alpha = alpha;
+    g_object_set(win->intensity_tag, "foreground-rgba", &color, NULL);
+
+    /* Only tag visible range + margin to avoid O(n) on entire buffer */
+    GdkRectangle visible;
+    gtk_text_view_get_visible_rect(win->text_view, &visible);
+
+    GtkTextIter start, end;
+    gtk_text_view_get_iter_at_location(win->text_view, &start,
+                                       visible.x, visible.y - 200);
+    gtk_text_view_get_iter_at_location(win->text_view, &end,
+                                       visible.x, visible.y + visible.height + 200);
+
+    gtk_text_buffer_apply_tag(win->buffer, win->intensity_tag, &start, &end);
+}
+
+void notes_window_apply_settings(NotesWindow *win) {
+    apply_theme(win);
+    apply_css(win);
+
+    int extra = (int)((win->settings.line_spacing - 1.0) * win->settings.font_size * 0.5);
+    if (extra < 0) extra = 0;
+    gtk_text_view_set_pixels_above_lines(win->text_view, extra);
+    gtk_text_view_set_pixels_below_lines(win->text_view, extra);
+
+    gtk_widget_set_visible(win->ln_scrolled, win->settings.show_line_numbers);
+    win->cached_line_count = 0;
+    if (win->settings.show_line_numbers)
+        update_line_numbers(win->buffer, win);
+
+    gtk_text_view_set_wrap_mode(win->text_view,
+        win->settings.wrap_lines ? GTK_WRAP_WORD_CHAR : GTK_WRAP_NONE);
+
+    apply_highlight_color(win);
+    update_line_highlights(win);
+    apply_font_intensity(win);
+}
+
+/* Max bytes to load into GtkTextBuffer — keeps UI responsive */
+#define MAX_DISPLAY_BYTES (5 * 1024 * 1024)  /* 5 MB */
+
+static const char *human_size(gsize bytes) {
+    static char buf[64];
+    if (bytes >= 1024ULL * 1024 * 1024)
+        snprintf(buf, sizeof(buf), "%.1f GB", (double)bytes / (1024.0 * 1024 * 1024));
+    else if (bytes >= 1024 * 1024)
+        snprintf(buf, sizeof(buf), "%.1f MB", (double)bytes / (1024.0 * 1024));
+    else if (bytes >= 1024)
+        snprintf(buf, sizeof(buf), "%.1f KB", (double)bytes / 1024.0);
+    else
+        snprintf(buf, sizeof(buf), "%lu B", (unsigned long)bytes);
+    return buf;
+}
+
+void notes_window_load_file(NotesWindow *win, const char *path) {
+    if (!path || path[0] == '\0') return;
+
+    /* Get file size first */
+    struct stat st;
+    if (g_stat(path, &st) != 0) return;
+    gsize file_size = (gsize)st.st_size;
+
+    /* Determine how much to read */
+    gboolean truncated = FALSE;
+    gsize read_size = file_size;
+    if (read_size > MAX_DISPLAY_BYTES) {
+        read_size = MAX_DISPLAY_BYTES;
+        truncated = TRUE;
+    }
+
+    /* Read only what we need */
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return;
+    char *contents = g_malloc(read_size + 1);
+    gsize len = fread(contents, 1, read_size, fp);
+    fclose(fp);
+    contents[len] = '\0';
+
+    /* Detect binary: check first 8KB for NUL bytes */
+    gboolean is_binary = FALSE;
+    gsize check_len = len < 8192 ? len : 8192;
+    for (gsize i = 0; i < check_len; i++) {
+        if (contents[i] == '\0') { is_binary = TRUE; break; }
+    }
+
+    /* Replace all NUL bytes with '.' */
+    if (is_binary) {
+        for (gsize i = 0; i < len; i++) {
+            if (contents[i] == '\0') contents[i] = '.';
+        }
+    }
+
+    /* Ensure valid UTF-8 — if not, convert lossily */
+    if (!g_utf8_validate(contents, (gssize)len, NULL)) {
+        is_binary = TRUE;
+        gsize bytes_written = 0;
+        char *utf8 = g_convert_with_fallback(contents, (gssize)len,
+                         "UTF-8", "ISO-8859-1", ".", NULL, &bytes_written, NULL);
+        if (utf8) {
+            g_free(contents);
+            contents = utf8;
+            len = bytes_written;
+        }
+    }
+
+    /* For binary/truncated files, skip original_content to save RAM */
+    g_free(win->original_content);
+    if (is_binary || truncated) {
+        win->original_content = NULL;
+    } else {
+        win->original_content = g_strndup(contents, len);
+    }
+
+    win->is_binary = is_binary;
+    win->is_truncated = truncated;
+
+    /* Block changed signal during load to prevent dirty state confusion */
+    g_signal_handlers_block_by_func(win->buffer, on_buffer_changed, win);
+    g_signal_handlers_block_by_func(win->buffer, on_cursor_moved, win);
+
+    gtk_text_buffer_set_text(win->buffer, contents, (int)len);
+    g_free(contents);
+
+    GtkTextIter start;
+    gtk_text_buffer_get_start_iter(win->buffer, &start);
+    gtk_text_buffer_place_cursor(win->buffer, &start);
+
+    /* Set state BEFORE unblock so any triggered callback sees correct values */
+    win->dirty = FALSE;
+    snprintf(win->current_file, sizeof(win->current_file), "%s", path);
+    snprintf(win->settings.last_file, sizeof(win->settings.last_file), "%s", path);
+
+    /* Show filename in title */
+    char *base = g_path_get_basename(path);
+    gtk_window_set_title(GTK_WINDOW(win->window), base);
+    g_free(base);
+
+    g_signal_handlers_unblock_by_func(win->buffer, on_buffer_changed, win);
+    g_signal_handlers_unblock_by_func(win->buffer, on_cursor_moved, win);
+
+    /* Status bar: show file info */
+    char status[128];
+    if (truncated)
+        snprintf(status, sizeof(status), "UTF-8 | %s | showing first 5 MB of %s",
+                 is_binary ? "BIN" : "TEXT", human_size(file_size));
+    else
+        snprintf(status, sizeof(status), "UTF-8 | %s | %s",
+                 is_binary ? "BIN" : "TEXT", human_size(file_size));
+    gtk_label_set_text(win->status_encoding, status);
+
+    /* Update line numbers and cursor for loaded content */
+    update_cursor_position(win);
+    if (win->settings.show_line_numbers)
+        update_line_numbers(win->buffer, win);
+    update_line_highlights(win);
+
+    settings_save(&win->settings);
+}
+
+static void auto_save_current(NotesWindow *win) {
+    if (!win->dirty) return;
+    /* Never auto-save over binary/truncated files */
+    if (win->is_binary || !win->original_content) return;
+
+    GtkTextIter start, end;
+    gtk_text_buffer_get_bounds(win->buffer, &start, &end);
+    char *text = gtk_text_buffer_get_text(win->buffer, &start, &end, FALSE);
+    if (!text || text[0] == '\0') {
+        g_free(text);
+        return;
+    }
+
+    if (win->current_file[0] != '\0') {
+        /* Atomic write: write to tmp, then rename */
+        char tmp[2112];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", win->current_file);
+        FILE *f = fopen(tmp, "w");
+        if (f) {
+            gboolean ok = (fputs(text, f) != EOF);
+            ok = ok && (fflush(f) == 0);
+            fclose(f);
+            if (ok)
+                g_rename(tmp, win->current_file);
+            else
+                g_remove(tmp);
+        }
+        snprintf(win->settings.last_file, sizeof(win->settings.last_file), "%s", win->current_file);
+    }
+    g_free(win->original_content);
+    win->original_content = text;
+    win->dirty = FALSE;
+}
+
+static gboolean on_close_request(GtkWindow *window, gpointer data) {
+    (void)window;
+    NotesWindow *win = data;
+    auto_save_current(win);
+
+    /* Always sync current_file → last_file before saving settings */
+    if (win->current_file[0] != '\0')
+        snprintf(win->settings.last_file, sizeof(win->settings.last_file),
+                 "%s", win->current_file);
+
+    win->settings.window_width = gtk_widget_get_width(GTK_WIDGET(win->window));
+    win->settings.window_height = gtk_widget_get_height(GTK_WIDGET(win->window));
+    settings_save(&win->settings);
+    return FALSE;
+}
+
+static void on_destroy(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    NotesWindow *win = data;
+
+    if (win->intensity_idle_id) {
+        g_source_remove(win->intensity_idle_id);
+        win->intensity_idle_id = 0;
+    }
+    if (win->scroll_idle_id) {
+        g_source_remove(win->scroll_idle_id);
+        win->scroll_idle_id = 0;
+    }
+    if (win->line_numbers_idle_id) {
+        g_source_remove(win->line_numbers_idle_id);
+        win->line_numbers_idle_id = 0;
+    }
+    if (win->title_idle_id) {
+        g_source_remove(win->title_idle_id);
+        win->title_idle_id = 0;
+    }
+    gtk_style_context_remove_provider_for_display(
+        gdk_display_get_default(),
+        GTK_STYLE_PROVIDER(win->css_provider));
+    g_object_unref(win->css_provider);
+
+    g_free(win->original_content);
+    g_free(win);
+}
+
+static GtkWidget *build_menu_button(void) {
+    GMenu *menu = g_menu_new();
+    g_menu_append(menu, "Open File", "win.open-file");
+    g_menu_append(menu, "Save", "win.save");
+    g_menu_append(menu, "Save As...", "win.save-as");
+    g_menu_append(menu, "New", "win.new-file");
+    g_menu_append(menu, "Settings", "win.settings");
+
+    GtkWidget *button = gtk_menu_button_new();
+    gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(button), "open-menu-symbolic");
+    gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(button), G_MENU_MODEL(menu));
+    g_object_unref(menu);
+    return button;
+}
+
+NotesWindow *notes_window_new(GtkApplication *app) {
+    NotesWindow *win = g_new0(NotesWindow, 1);
+    settings_load(&win->settings);
+
+    win->window = GTK_APPLICATION_WINDOW(gtk_application_window_new(app));
+    gtk_window_set_title(GTK_WINDOW(win->window), "Notes Light");
+    gtk_window_set_default_size(GTK_WINDOW(win->window),
+                                win->settings.window_width,
+                                win->settings.window_height);
+
+    g_signal_connect(win->window, "close-request", G_CALLBACK(on_close_request), win);
+    g_signal_connect(win->window, "destroy", G_CALLBACK(on_destroy), win);
+
+    /* Header bar */
+    GtkWidget *header = gtk_header_bar_new();
+    GtkWidget *menu_btn = build_menu_button();
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(header), menu_btn);
+    gtk_window_set_titlebar(GTK_WINDOW(win->window), header);
+
+    /* Line numbers */
+    win->line_numbers = GTK_DRAWING_AREA(gtk_drawing_area_new());
+    gtk_widget_set_can_focus(GTK_WIDGET(win->line_numbers), FALSE);
+    gtk_widget_add_css_class(GTK_WIDGET(win->line_numbers), "line-numbers");
+    gtk_drawing_area_set_draw_func(win->line_numbers, draw_line_numbers, win, NULL);
+
+    /* Text view (custom subclass) */
+    NotesTextView *ntv = g_object_new(NOTES_TYPE_TEXT_VIEW, NULL);
+    ntv->win = win;
+    win->text_view = GTK_TEXT_VIEW(ntv);
+    win->buffer = gtk_text_view_get_buffer(win->text_view);
+    gtk_text_view_set_wrap_mode(win->text_view, GTK_WRAP_WORD_CHAR);
+    gtk_text_view_set_left_margin(win->text_view, 12);
+    gtk_text_view_set_right_margin(win->text_view, 12);
+    gtk_text_view_set_top_margin(win->text_view, 8);
+    gtk_text_view_set_bottom_margin(win->text_view, 8);
+
+    /* Font intensity tag */
+    win->intensity_tag = gtk_text_buffer_create_tag(win->buffer, "intensity",
+                                                     "foreground-rgba", NULL, NULL);
+
+    g_signal_connect(win->buffer, "changed", G_CALLBACK(on_buffer_changed), win);
+    g_signal_connect(win->buffer, "notify::cursor-position", G_CALLBACK(on_cursor_moved), win);
+
+    /* Scrolled window for text view */
+    GtkWidget *scrolled = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled), GTK_WIDGET(win->text_view));
+    gtk_widget_set_vexpand(scrolled, TRUE);
+    gtk_widget_set_hexpand(scrolled, TRUE);
+
+    /* Line numbers container */
+    win->ln_scrolled = GTK_WIDGET(win->line_numbers);
+    gtk_widget_set_vexpand(win->ln_scrolled, TRUE);
+
+    /* Redraw line numbers when the main text view scrolls */
+    GtkAdjustment *main_vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(scrolled));
+    g_signal_connect_swapped(main_vadj, "value-changed",
+                             G_CALLBACK(gtk_widget_queue_draw), win->line_numbers);
+
+    /* HBox: line numbers + text view */
+    win->editor_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_box_append(GTK_BOX(win->editor_box), win->ln_scrolled);
+    gtk_box_append(GTK_BOX(win->editor_box), scrolled);
+
+    /* Status bar */
+    GtkWidget *status_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(status_bar, "statusbar");
+    gtk_widget_set_margin_start(status_bar, 8);
+    gtk_widget_set_margin_end(status_bar, 8);
+    gtk_widget_set_margin_top(status_bar, 2);
+    gtk_widget_set_margin_bottom(status_bar, 2);
+
+    win->status_encoding = GTK_LABEL(gtk_label_new("UTF-8"));
+    gtk_widget_set_halign(GTK_WIDGET(win->status_encoding), GTK_ALIGN_START);
+    gtk_widget_set_hexpand(GTK_WIDGET(win->status_encoding), TRUE);
+    gtk_box_append(GTK_BOX(status_bar), GTK_WIDGET(win->status_encoding));
+
+    win->status_cursor = GTK_LABEL(gtk_label_new("Ln 1, Col 1"));
+    gtk_widget_set_halign(GTK_WIDGET(win->status_cursor), GTK_ALIGN_END);
+    gtk_box_append(GTK_BOX(status_bar), GTK_WIDGET(win->status_cursor));
+
+    /* Main vbox: editor + statusbar */
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_vexpand(win->editor_box, TRUE);
+    gtk_box_append(GTK_BOX(vbox), win->editor_box);
+    gtk_box_append(GTK_BOX(vbox), status_bar);
+
+    gtk_window_set_child(GTK_WINDOW(win->window), vbox);
+
+    /* CSS provider */
+    win->css_provider = gtk_css_provider_new();
+    gtk_style_context_add_provider_for_display(
+        gdk_display_get_default(),
+        GTK_STYLE_PROVIDER(win->css_provider),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+    /* Actions & shortcuts */
+    actions_setup(win, app);
+
+    /* Apply settings */
+    notes_window_apply_settings(win);
+
+    /* Restore last file */
+    if (win->settings.last_file[0] != '\0')
+        notes_window_load_file(win, win->settings.last_file);
+
+    return win;
+}
