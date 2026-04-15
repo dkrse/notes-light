@@ -2,12 +2,15 @@
 #define NOTES_WINDOW_H
 
 #include <gtk/gtk.h>
+#include <gtksourceview/gtksource.h>
 #include "settings.h"
 
 typedef struct {
     GtkApplicationWindow *window;
-    GtkTextView          *text_view;
-    GtkTextBuffer        *buffer;
+    GtkSourceView        *source_view;
+    GtkSourceBuffer      *source_buffer;
+    GtkTextView          *text_view;     /* alias for source_view */
+    GtkTextBuffer        *buffer;        /* alias for source_buffer */
     GtkDrawingArea       *line_numbers;
     GtkWidget            *ln_scrolled;
     GtkWidget            *editor_box;

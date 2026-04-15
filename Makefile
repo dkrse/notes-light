@@ -1,6 +1,6 @@
 CC = gcc
-CFLAGS = -std=c17 -Wall -Wextra -O2 $(shell pkg-config --cflags libadwaita-1)
-LDFLAGS = $(shell pkg-config --libs libadwaita-1)
+CFLAGS = -std=c17 -Wall -Wextra -O2 $(shell pkg-config --cflags libadwaita-1 gtksourceview-5)
+LDFLAGS = $(shell pkg-config --libs libadwaita-1 gtksourceview-5)
 
 BUILDDIR = build
 SRC = src/main.c src/window.c src/settings.c src/actions.c src/ssh.c

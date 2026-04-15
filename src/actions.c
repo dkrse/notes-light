@@ -258,6 +258,11 @@ static void on_wrap_lines_toggled(GtkCheckButton *btn, gpointer data) {
     win->settings.wrap_lines = gtk_check_button_get_active(btn);
 }
 
+static void on_highlight_syntax_toggled(GtkCheckButton *btn, gpointer data) {
+    NotesWindow *win = data;
+    win->settings.highlight_syntax = gtk_check_button_get_active(btn);
+}
+
 static void on_intensity_changed(GtkRange *range, gpointer data) {
     NotesWindow *win = data;
     win->settings.font_intensity = gtk_range_get_value(range);
@@ -386,6 +391,13 @@ static void on_settings(GSimpleAction *action, GVariant *param, gpointer data) {
     gtk_check_button_set_active(GTK_CHECK_BUTTON(wrap_check), win->settings.wrap_lines);
     g_signal_connect(wrap_check, "toggled", G_CALLBACK(on_wrap_lines_toggled), win);
     gtk_grid_attach(GTK_GRID(grid), wrap_check, 1, row++, 1, 1);
+
+    /* Syntax highlighting */
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Syntax Highlight:"), 0, row, 1, 1);
+    GtkWidget *hl_syntax_check = gtk_check_button_new();
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(hl_syntax_check), win->settings.highlight_syntax);
+    g_signal_connect(hl_syntax_check, "toggled", G_CALLBACK(on_highlight_syntax_toggled), win);
+    gtk_grid_attach(GTK_GRID(grid), hl_syntax_check, 1, row++, 1, 1);
 
     /* Buttons */
     GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);

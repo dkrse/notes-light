@@ -28,6 +28,7 @@ static void on_quit(GSimpleAction *action, GVariant *param, gpointer app) {
 }
 
 int main(int argc, char *argv[]) {
+    gtk_source_init();
     AdwApplication *app = adw_application_new("com.notes.light",
                                                G_APPLICATION_DEFAULT_FLAGS);
 
@@ -41,5 +42,6 @@ int main(int argc, char *argv[]) {
 
     int status = g_application_run(G_APPLICATION(app), argc, argv);
     g_object_unref(app);
+    gtk_source_finalize();
     return status;
 }

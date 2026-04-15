@@ -7,11 +7,15 @@ Notes Light is a single-window GTK 4 text editor with SSH/SFTP remote file editi
 ## File Structure
 
 ```
+data/
+  language-specs/
+    asm.lang    Custom Assembly language definition (x86/ARM)
 src/
-  main.c        Entry point, GtkApplication, title restore idle
+  main.c        Entry point, GtkApplication, GtkSourceView init, title restore idle
   window.h      NotesWindow struct, public API
-  window.c      Core UI: text view, line numbers, themes, CSS, file I/O,
-                search/replace, go-to-line, SSH state, remote file open/save
+  window.c      Core UI: source view (GtkSourceView), line numbers, themes, CSS,
+                syntax highlighting, file I/O, search/replace, go-to-line,
+                SSH state, remote file open/save
   settings.h    NotesSettings struct, SftpConnection/SftpConnections structs
   settings.c    Key=value config file parser/writer, connections load/save
   actions.h     actions_setup declaration
@@ -28,7 +32,7 @@ Startup:
   main → AdwApplication → on_activate
     → notes_window_new
       → settings_load (key=value from disk)
-      → build UI (headerbar, text view, line numbers, status bar, search bar)
+      → build UI (headerbar, source view, line numbers, status bar, search bar)
       → actions_setup (GActions + keyboard accels)
       → notes_window_apply_settings (theme, CSS, font, line spacing, intensity)
       → notes_window_load_file (restore last file)
@@ -48,6 +52,7 @@ Editing:
 File Load (local):
   fopen("rb") → fread (max 5 MB) → NUL→'.' → g_utf8_validate
     → g_convert_with_fallback if needed
+    → apply_source_language (detect from filename) → apply_source_style
     → block signals → set_text → set state → unblock signals
     → apply_font_intensity
 
@@ -108,11 +113,14 @@ All file writes (content, settings) use tmp + rename pattern. A crash during wri
 ### CSS Injection Protection
 Font names from config are sanitized via `css_escape_font()` which strips `} { ; " ' \` before embedding into CSS strings.
 
+### Syntax Highlighting
+Uses GtkSourceView 5. The text view is a custom subclass of GtkSourceView (instead of GtkTextView) to preserve the current line highlight overlay. Language is auto-detected from the filename via `gtk_source_language_manager_guess_language` before text is loaded into the buffer — this ensures highlighting is applied immediately, including on startup when restoring the last file. Custom language definitions (e.g. Assembly) are loaded from `data/language-specs/` next to the executable. When syntax highlighting is enabled, CSS omits `color:` from `textview text` so the style scheme controls syntax colors. Each app theme maps to a GtkSourceView style scheme (e.g. solarized→solarized, monokai→oblivion, nord→cobalt). Toggled via Settings checkbox; state persisted in settings.conf.
+
 ### Theme System
-13 built-in themes. Custom themes define fg/bg colors and full CSS for headerbar, popover, status bar, line numbers, dialog widgets (entry, label, list, button, separator, scrolledwindow). System/light/dark themes use AdwStyleManager color scheme with minimal CSS. All dialogs use AdwHeaderBar for consistent theming.
+13 built-in themes. Custom themes define fg/bg colors and full CSS for headerbar, popover, status bar, line numbers, dialog widgets (entry, label, list, button, separator, scrolledwindow). System/light/dark themes use AdwStyleManager color scheme with minimal CSS. All dialogs use AdwHeaderBar for consistent theming. When syntax highlighting is on, text foreground color is controlled by the GtkSourceView style scheme rather than CSS.
 
 ### Font Intensity
-Applied as a text tag with alpha-channel foreground color on the entire buffer. Re-applied after file load and on buffer changes via idle callback.
+When syntax highlighting is off: applied as a text tag with alpha-channel foreground color on the entire buffer. When syntax highlighting is on: applied as CSS opacity on the text view widget (preserving syntax colors). Re-applied after file load and on buffer changes via idle callback.
 
 ### Search with Scrollbar Markers
 Search highlights all matches with a GtkTextTag. Match line numbers are collected and drawn as orange markers on a GtkDrawingArea overlay positioned at the right edge of the scrolled window.
@@ -138,7 +146,7 @@ When closing with unsaved changes, a `GtkAlertDialog` presents three options: Sa
 ## NotesWindow Struct
 
 Central state object, heap-allocated via `g_new0`. Holds:
-- GTK widget pointers (window, text_view, buffer, line_numbers, labels)
+- GTK widget pointers (window, source_view, source_buffer, text_view/buffer aliases, line_numbers, labels)
 - Settings struct (inline, not pointer)
 - CSS provider
 - File state (current_file path, dirty flag, is_binary, is_truncated, original_content)

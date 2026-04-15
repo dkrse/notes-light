@@ -33,6 +33,7 @@ void settings_load(NotesSettings *s) {
     s->show_line_numbers = FALSE;
     s->highlight_current_line = TRUE;
     s->wrap_lines = TRUE;
+    s->highlight_syntax = TRUE;
     s->window_width = 700;
     s->window_height = 500;
     s->last_file[0] = '\0';
@@ -79,6 +80,8 @@ void settings_load(NotesSettings *s) {
             s->highlight_current_line = (strcmp(val, "1") == 0);
         else if (strcmp(key, "wrap_lines") == 0)
             s->wrap_lines = (strcmp(val, "1") == 0);
+        else if (strcmp(key, "highlight_syntax") == 0)
+            s->highlight_syntax = (strcmp(val, "1") == 0);
         else if (strcmp(key, "window_width") == 0) {
             int v = atoi(val); if (v >= 200 && v <= 8192) s->window_width = v;
         } else if (strcmp(key, "window_height") == 0) {
@@ -181,6 +184,7 @@ void settings_save(const NotesSettings *s) {
     fprintf(f, "show_line_numbers=%d\n", s->show_line_numbers);
     fprintf(f, "highlight_current_line=%d\n", s->highlight_current_line);
     fprintf(f, "wrap_lines=%d\n", s->wrap_lines);
+    fprintf(f, "highlight_syntax=%d\n", s->highlight_syntax);
     fprintf(f, "window_width=%d\n", s->window_width);
     fprintf(f, "window_height=%d\n", s->window_height);
     fprintf(f, "last_file=%s\n", s->last_file);

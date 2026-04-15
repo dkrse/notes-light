@@ -57,14 +57,14 @@ static gboolean is_dark_theme(const char *theme);
  */
 
 #define NOTES_TYPE_TEXT_VIEW (notes_text_view_get_type())
-G_DECLARE_FINAL_TYPE(NotesTextView, notes_text_view, NOTES, TEXT_VIEW, GtkTextView)
+G_DECLARE_FINAL_TYPE(NotesTextView, notes_text_view, NOTES, TEXT_VIEW, GtkSourceView)
 
 struct _NotesTextView {
-    GtkTextView parent;
+    GtkSourceView parent;
     NotesWindow *win;
 };
 
-G_DEFINE_TYPE(NotesTextView, notes_text_view, GTK_TYPE_TEXT_VIEW)
+G_DEFINE_TYPE(NotesTextView, notes_text_view, GTK_SOURCE_TYPE_VIEW)
 
 static void notes_text_view_snapshot(GtkWidget *widget, GtkSnapshot *snapshot) {
     NotesTextView *self = NOTES_TEXT_VIEW(widget);
@@ -119,6 +119,93 @@ static void apply_highlight_color(NotesWindow *win) {
     }
 }
 
+static const char *scheme_for_theme(const char *theme) {
+    if (strcmp(theme, "solarized-light") == 0) return "solarized-light";
+    if (strcmp(theme, "solarized-dark") == 0)  return "solarized-dark";
+    if (strcmp(theme, "monokai") == 0)         return "oblivion";
+    if (strcmp(theme, "gruvbox-dark") == 0)     return "classic-dark";
+    if (strcmp(theme, "gruvbox-light") == 0)    return "kate";
+    if (strcmp(theme, "nord") == 0)             return "cobalt";
+    if (strcmp(theme, "dracula") == 0)          return "oblivion";
+    if (strcmp(theme, "tokyo-night") == 0)      return "Adwaita-dark";
+    if (strcmp(theme, "catppuccin-mocha") == 0) return "Adwaita-dark";
+    if (strcmp(theme, "catppuccin-latte") == 0) return "Adwaita";
+    if (strcmp(theme, "dark") == 0)             return "Adwaita-dark";
+    if (strcmp(theme, "light") == 0)            return "Adwaita";
+    /* system */
+    return "Adwaita";
+}
+
+static void apply_source_style(NotesWindow *win) {
+    GtkSourceStyleSchemeManager *sm = gtk_source_style_scheme_manager_get_default();
+    const char *scheme_id = scheme_for_theme(win->settings.theme);
+
+    /* For "system" theme, pick based on current dark mode */
+    if (strcmp(win->settings.theme, "system") == 0) {
+        AdwStyleManager *adw = adw_style_manager_get_default();
+        if (adw_style_manager_get_dark(adw))
+            scheme_id = "Adwaita-dark";
+        else
+            scheme_id = "Adwaita";
+    }
+
+    GtkSourceStyleScheme *scheme = gtk_source_style_scheme_manager_get_scheme(sm, scheme_id);
+    if (scheme)
+        gtk_source_buffer_set_style_scheme(win->source_buffer, scheme);
+
+    gtk_source_buffer_set_highlight_syntax(win->source_buffer, win->settings.highlight_syntax);
+}
+
+static void apply_source_language(NotesWindow *win, const char *path) {
+    if (!win->settings.highlight_syntax) {
+        gtk_source_buffer_set_language(win->source_buffer, NULL);
+        return;
+    }
+    GtkSourceLanguageManager *lm = gtk_source_language_manager_get_default();
+
+    /* Add custom language specs path (next to executable or installed) */
+    static gboolean paths_set = FALSE;
+    if (!paths_set) {
+        const gchar * const *old = gtk_source_language_manager_get_search_path(lm);
+        GPtrArray *dirs = g_ptr_array_new();
+
+        /* App-local data dir */
+        char exe_dir[1024];
+        ssize_t n = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);
+        if (n > 0) {
+            exe_dir[n] = '\0';
+            char *slash = strrchr(exe_dir, '/');
+            if (slash) *slash = '\0';
+            char custom[1088];
+            snprintf(custom, sizeof(custom), "%s/../data/language-specs", exe_dir);
+            g_ptr_array_add(dirs, g_strdup(custom));
+            /* Also check installed location */
+            snprintf(custom, sizeof(custom), "%s/data/language-specs", exe_dir);
+            g_ptr_array_add(dirs, g_strdup(custom));
+        }
+
+        for (int i = 0; old && old[i]; i++)
+            g_ptr_array_add(dirs, g_strdup(old[i]));
+        g_ptr_array_add(dirs, NULL);
+        gtk_source_language_manager_set_search_path(lm, (const gchar * const *)dirs->pdata);
+        g_ptr_array_unref(dirs);
+        paths_set = TRUE;
+    }
+
+    GtkSourceLanguage *lang = gtk_source_language_manager_guess_language(lm, path, NULL);
+
+    /* Fallback: try to detect Makefile by basename */
+    if (!lang) {
+        const char *base = strrchr(path, '/');
+        base = base ? base + 1 : path;
+        if (g_ascii_strncasecmp(base, "Makefile", 8) == 0 ||
+            g_ascii_strncasecmp(base, "GNUmakefile", 11) == 0)
+            lang = gtk_source_language_manager_get_language(lm, "makefile");
+    }
+
+    gtk_source_buffer_set_language(win->source_buffer, lang);
+}
+
 /* Escape a string for safe CSS embedding: strip } ; { and quotes */
 static void css_escape_font(char *out, size_t out_sz, const char *in) {
     size_t j = 0;
@@ -150,10 +237,11 @@ static void apply_css(NotesWindow *win) {
     if (td) {
         const char *bg = td->bg;
         const char *fg = td->fg;
+        gboolean hl = win->settings.highlight_syntax;
 
         snprintf(css, sizeof(css),
             "textview { font-family: %s; font-size: %dpt; background-color: %s; }"
-            "textview text { background-color: %s; color: %s; }"
+            "textview text { background-color: %s;%s%s%s }"
             ".line-numbers, .line-numbers text {"
             "  background-color: %s; color: alpha(%s, 0.3); }"
             ".titlebar, headerbar {"
@@ -187,7 +275,7 @@ static void apply_css(NotesWindow *win) {
             "scrolledwindow { background-color: %s; }"
             "separator { background-color: alpha(%s, 0.15); }",
             safe_font, win->settings.font_size, bg,
-            bg, fg,
+            bg, hl ? "" : " color: ", hl ? "" : fg, hl ? "" : ";",
             bg, fg,
             bg, fg,
             fg,
@@ -217,15 +305,16 @@ static void apply_css(NotesWindow *win) {
         } else {
             bg = "#ffffff"; fg = "#1e1e1e";
         }
+        gboolean hl = win->settings.highlight_syntax;
 
         snprintf(css, sizeof(css),
             "textview { font-family: %s; font-size: %dpt; background-color: %s; }"
-            "textview text { background-color: %s; color: %s; }"
+            "textview text { background-color: %s;%s%s%s }"
             ".line-numbers, .line-numbers text {"
             "  background-color: %s; color: alpha(%s, 0.3); }"
             ".statusbar { font-size: 10pt; padding: 2px 4px; opacity: 0.7; }",
             safe_font, win->settings.font_size, bg,
-            bg, fg,
+            bg, hl ? "" : " color: ", hl ? "" : fg, hl ? "" : ";",
             bg, fg);
     }
 
@@ -474,12 +563,22 @@ static void update_line_numbers(GtkTextBuffer *buffer, NotesWindow *win) {
 static void apply_font_intensity(NotesWindow *win) {
     double alpha = win->settings.font_intensity;
 
-    if (alpha >= 0.99) {
-        GtkTextIter start, end;
-        gtk_text_buffer_get_bounds(win->buffer, &start, &end);
-        gtk_text_buffer_remove_tag(win->buffer, win->intensity_tag, &start, &end);
+    /* Remove old intensity tag */
+    GtkTextIter start, end;
+    gtk_text_buffer_get_bounds(win->buffer, &start, &end);
+    gtk_text_buffer_remove_tag(win->buffer, win->intensity_tag, &start, &end);
+
+    /* When syntax highlighting is on, use CSS opacity to preserve colors */
+    if (win->settings.highlight_syntax) {
+        gtk_widget_set_opacity(GTK_WIDGET(win->text_view),
+                               alpha >= 0.99 ? 1.0 : alpha);
         return;
     }
+
+    gtk_widget_set_opacity(GTK_WIDGET(win->text_view), 1.0);
+
+    if (alpha >= 0.99)
+        return;
 
     const char *fg = NULL;
     for (int i = 0; custom_themes[i].name; i++) {
@@ -500,7 +599,6 @@ static void apply_font_intensity(NotesWindow *win) {
     color.alpha = alpha;
     g_object_set(win->intensity_tag, "foreground-rgba", &color, NULL);
 
-    GtkTextIter start, end;
     gtk_text_buffer_get_bounds(win->buffer, &start, &end);
     gtk_text_buffer_apply_tag(win->buffer, win->intensity_tag, &start, &end);
 }
@@ -525,6 +623,7 @@ void notes_window_apply_settings(NotesWindow *win) {
     apply_highlight_color(win);
     update_line_highlights(win);
     apply_font_intensity(win);
+    apply_source_style(win);
 }
 
 /* Max bytes to load into GtkTextBuffer — keeps UI responsive */
@@ -604,6 +703,10 @@ void notes_window_load_file(NotesWindow *win, const char *path) {
 
     win->is_binary = is_binary;
     win->is_truncated = truncated;
+
+    /* Set language BEFORE loading text so highlighting applies immediately */
+    apply_source_language(win, path);
+    apply_source_style(win);
 
     /* Block changed signal during load to prevent dirty state confusion */
     g_signal_handlers_block_by_func(win->buffer, on_buffer_changed, win);
@@ -1302,11 +1405,13 @@ NotesWindow *notes_window_new(GtkApplication *app) {
     gtk_widget_add_css_class(GTK_WIDGET(win->line_numbers), "line-numbers");
     gtk_drawing_area_set_draw_func(win->line_numbers, draw_line_numbers, win, NULL);
 
-    /* Text view (custom subclass) */
-    NotesTextView *ntv = g_object_new(NOTES_TYPE_TEXT_VIEW, NULL);
+    /* Source buffer + text view (custom subclass) */
+    win->source_buffer = gtk_source_buffer_new(NULL);
+    win->buffer = GTK_TEXT_BUFFER(win->source_buffer);
+    NotesTextView *ntv = g_object_new(NOTES_TYPE_TEXT_VIEW, "buffer", win->buffer, NULL);
     ntv->win = win;
+    win->source_view = GTK_SOURCE_VIEW(ntv);
     win->text_view = GTK_TEXT_VIEW(ntv);
-    win->buffer = gtk_text_view_get_buffer(win->text_view);
     gtk_text_view_set_wrap_mode(win->text_view, GTK_WRAP_WORD_CHAR);
     gtk_text_view_set_left_margin(win->text_view, 12);
     gtk_text_view_set_right_margin(win->text_view, 12);

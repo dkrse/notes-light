@@ -5,8 +5,10 @@ Fast, minimal text editor written in C with GTK 4 and libadwaita.
 ## Features
 
 - Plain text editing with no database, no sidebar, no markdown
+- Syntax highlighting via GtkSourceView 5 (auto-detected from file extension, toggle in Settings)
 - Opens any file including binaries (displayed as text, max 5 MB view)
 - 13 color themes (System, Light, Dark, Solarized, Monokai, Gruvbox, Nord, Dracula, Tokyo Night, Catppuccin)
+- Theme-aware syntax color schemes (each theme maps to a matching GtkSourceView style scheme)
 - Line numbers with Cairo rendering
 - Current line highlight (overlay)
 - Font intensity (alpha blending)
@@ -29,6 +31,7 @@ Fast, minimal text editor written in C with GTK 4 and libadwaita.
 
 - GTK 4
 - libadwaita-1
+- GtkSourceView 5 (syntax highlighting)
 - OpenSSH client (for SFTP features)
 
 ## Build

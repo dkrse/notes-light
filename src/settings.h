@@ -14,6 +14,7 @@ typedef struct {
     gboolean show_line_numbers;
     gboolean highlight_current_line;
     gboolean wrap_lines;
+    gboolean highlight_syntax;
     int window_width;
     int window_height;
     char last_file[2048];

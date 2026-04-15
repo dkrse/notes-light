@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.0 (2026-04-15)
+
+### Added
+- Syntax highlighting via GtkSourceView 5 with auto language detection from filename
+- Syntax Highlight toggle in Settings dialog (on by default, persisted in settings.conf)
+- Theme-aware syntax color schemes — each app theme maps to a matching GtkSourceView style scheme (solarized→solarized, monokai→oblivion, nord→cobalt, gruvbox→classic-dark/kate, etc.)
+- Custom Assembly language definition (data/language-specs/asm.lang) with x86/ARM registers, instructions, NASM/MASM/GAS directives
+- Makefile highlighting support (built-in GtkSourceView language + basename fallback detection)
+- GtkSourceView 5 dependency added to Makefile
+
+### Changed
+- Text view is now a custom subclass of GtkSourceView instead of GtkTextView
+- GtkSourceBuffer replaces GtkTextBuffer (with backward-compatible aliases)
+- Language detection and style scheme applied before text is loaded into buffer (fixes highlight missing on startup file restore)
+- CSS no longer sets text foreground color when syntax highlighting is on (style scheme controls it)
+- Font intensity uses CSS opacity instead of foreground text tag when syntax highlighting is on (preserves syntax colors)
+
 ## 1.1.0 (2026-04-15)
 
 ### Added
@@ -62,6 +79,6 @@ Initial release. Stripped-down fork of notes-desktop.
 - SQLite FTS5 database
 - Sidebar with search
 - PDF export (Poppler + Cairo)
-- Syntax highlighting
+- Syntax highlighting (re-added in 1.2.0 via GtkSourceView 5)
 - Pack notes (archive)
 - Markdown preview
