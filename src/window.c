@@ -307,9 +307,35 @@ static gboolean intensity_idle_cb(gpointer data) {
 }
 
 static void update_dirty_state(NotesWindow *win) {
+    /* Check if content matches original — if so, clear dirty */
+    if (win->original_content) {
+        GtkTextIter s, e;
+        gtk_text_buffer_get_bounds(win->buffer, &s, &e);
+        char *text = gtk_text_buffer_get_text(win->buffer, &s, &e, FALSE);
+        gboolean same = (strcmp(text, win->original_content) == 0);
+        g_free(text);
+
+        if (same && win->dirty) {
+            win->dirty = FALSE;
+            if (win->current_file[0]) {
+                char *base = g_path_get_basename(win->current_file);
+                if (notes_window_is_remote(win)) {
+                    char title[512];
+                    snprintf(title, sizeof(title), "%s [%s@%s]", base, win->ssh_user, win->ssh_host);
+                    gtk_window_set_title(GTK_WINDOW(win->window), title);
+                } else {
+                    gtk_window_set_title(GTK_WINDOW(win->window), base);
+                }
+                g_free(base);
+            } else {
+                gtk_window_set_title(GTK_WINDOW(win->window), "Notes Light");
+            }
+            return;
+        }
+    }
+
     if (!win->dirty) {
         win->dirty = TRUE;
-        /* Show filename with dirty marker */
         if (win->current_file[0]) {
             char *base = g_path_get_basename(win->current_file);
             char title[256];
@@ -657,16 +683,10 @@ static void auto_save_current(NotesWindow *win) {
     win->dirty = FALSE;
 }
 
-static gboolean on_close_request(GtkWindow *window, gpointer data) {
-    (void)window;
-    NotesWindow *win = data;
-    auto_save_current(win);
-
-    /* Disconnect SSH if active */
+static void close_and_cleanup(NotesWindow *win) {
     if (notes_window_is_remote(win))
         notes_window_ssh_disconnect(win);
 
-    /* Don't save remote path as last_file */
     if (win->current_file[0] != '\0' && !ssh_path_is_remote(win->current_file))
         snprintf(win->settings.last_file, sizeof(win->settings.last_file),
                  "%s", win->current_file);
@@ -674,7 +694,46 @@ static gboolean on_close_request(GtkWindow *window, gpointer data) {
     win->settings.window_width = gtk_widget_get_width(GTK_WIDGET(win->window));
     win->settings.window_height = gtk_widget_get_height(GTK_WIDGET(win->window));
     settings_save(&win->settings);
-    return FALSE;
+    gtk_window_destroy(GTK_WINDOW(win->window));
+}
+
+static void on_close_save_response(GObject *src, GAsyncResult *res, gpointer data) {
+    NotesWindow *win = data;
+    GtkAlertDialog *dlg = GTK_ALERT_DIALOG(src);
+    int btn = gtk_alert_dialog_choose_finish(dlg, res, NULL);
+
+    if (btn == 0) {
+        /* Save */
+        auto_save_current(win);
+        close_and_cleanup(win);
+    } else if (btn == 1) {
+        /* Don't Save */
+        win->dirty = FALSE;
+        close_and_cleanup(win);
+    }
+    /* btn == 2 or -1 (Cancel / closed) — do nothing, stay open */
+}
+
+static gboolean on_close_request(GtkWindow *window, gpointer data) {
+    (void)window;
+    NotesWindow *win = data;
+
+    if (!win->dirty) {
+        close_and_cleanup(win);
+        return TRUE;
+    }
+
+    /* Show save confirmation dialog */
+    GtkAlertDialog *dlg = gtk_alert_dialog_new("Save changes before closing?");
+    gtk_alert_dialog_set_detail(dlg, "If you don't save, your changes will be lost.");
+    const char *buttons[] = {"Save", "Don't Save", "Cancel", NULL};
+    gtk_alert_dialog_set_buttons(dlg, buttons);
+    gtk_alert_dialog_set_default_button(dlg, 0);
+    gtk_alert_dialog_set_cancel_button(dlg, 2);
+    gtk_alert_dialog_choose(dlg, GTK_WINDOW(win->window), NULL, on_close_save_response, win);
+    g_object_unref(dlg);
+
+    return TRUE; /* block close until user responds */
 }
 
 static void on_destroy(GtkWidget *widget, gpointer data) {
@@ -1057,13 +1116,21 @@ gboolean notes_window_is_remote(NotesWindow *win) {
 }
 
 static void update_ssh_status(NotesWindow *win) {
-    if (notes_window_is_remote(win)) {
+    gboolean connected = notes_window_is_remote(win);
+    if (connected) {
         char label[512];
         snprintf(label, sizeof(label), "SSH: %s@%s", win->ssh_user, win->ssh_host);
         gtk_button_set_label(GTK_BUTTON(win->ssh_status_btn), label);
     } else {
         gtk_button_set_label(GTK_BUTTON(win->ssh_status_btn), "SSH: Off");
     }
+
+    /* Enable/disable SSH-dependent actions */
+    GAction *a;
+    a = g_action_map_lookup_action(G_ACTION_MAP(win->window), "open-remote");
+    if (a) g_simple_action_set_enabled(G_SIMPLE_ACTION(a), connected);
+    a = g_action_map_lookup_action(G_ACTION_MAP(win->window), "sftp-disconnect");
+    if (a) g_simple_action_set_enabled(G_SIMPLE_ACTION(a), connected);
 }
 
 void notes_window_ssh_connect(NotesWindow *win,
@@ -1390,6 +1457,9 @@ NotesWindow *notes_window_new(GtkApplication *app) {
 
     /* Actions & shortcuts */
     actions_setup(win, app);
+
+    /* Disable SSH-dependent actions until connected */
+    update_ssh_status(win);
 
     /* Apply settings */
     notes_window_apply_settings(win);

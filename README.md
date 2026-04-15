@@ -14,12 +14,13 @@ Fast, minimal text editor written in C with GTK 4 and libadwaita.
 - Zoom (Ctrl+/-)
 - Find & Replace (Ctrl+F / Ctrl+H) with match count, scrollbar markers
 - Go to Line (Ctrl+G)
-- SSH/SFTP remote file editing (connect, browse, open, save)
+- SSH/SFTP remote file editing (connect, browse, open, save) with disabled menu items when disconnected
 - Status bar (encoding, file type, size, cursor position, SSH status)
 - Persistent settings (~/.config/notes-light/settings.conf)
 - Saved SSH connection profiles (~/.config/notes-light/connections.conf)
+- Save confirmation dialog on close with unsaved changes (Save / Don't Save / Cancel)
+- Smart dirty detection (undo back to original clears dirty flag)
 - Auto-restore last opened file
-- Auto-save on close
 - Atomic file writes (tmp + rename)
 - CSS injection protection
 - Full theme support for all dialogs

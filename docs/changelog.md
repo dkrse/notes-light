@@ -21,6 +21,10 @@
 - AdwHeaderBar on all dialog windows (Settings, SFTP, Open Remote, Go to Line)
 - Full theme CSS for dialog widgets (entry, label, list, button, separator, scrolledwindow, checkbutton, scale)
 - Find, Find & Replace, Go to Line in hamburger menu
+- Save confirmation dialog on close with unsaved changes (Save / Don't Save / Cancel)
+- Smart dirty detection — undo back to original content clears dirty flag and removes `*` from title
+- "Open Remote File" and "SFTP Disconnect" menu items disabled when not connected
+- Application icon (SVG + PNG) and .desktop launcher
 
 ### Fixed
 - Font intensity now applies to entire buffer (was only visible range + margin, causing 100% intensity on scroll)

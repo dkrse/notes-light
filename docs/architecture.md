@@ -37,7 +37,8 @@ Startup:
 
 Editing:
   keystroke → GtkTextBuffer "changed" signal
-    → update_dirty_state (title += " *")
+    → update_dirty_state (compare with original_content;
+        set dirty + " *" if different, clear dirty if same)
     → update_line_numbers (idle scheduled)
     → update_cursor_position (status bar Ln/Col)
     → update_line_highlights (queue_draw)
@@ -79,8 +80,14 @@ Remote File Browser:
     → click dir → navigate, click file → notes_window_open_remote_file
 
 Close:
-  on_close_request → auto_save_current → ssh_disconnect if active
-    → sync last_file (skip remote paths) → settings_save
+  on_close_request
+    → if dirty: show GtkAlertDialog (Save / Don't Save / Cancel)
+      → Save: auto_save_current → close_and_cleanup
+      → Don't Save: discard → close_and_cleanup
+      → Cancel: stay open
+    → if clean: close_and_cleanup
+  close_and_cleanup → ssh_disconnect if active
+    → sync last_file (skip remote paths) → settings_save → destroy
     → on_destroy → cancel idle sources → free resources
 ```
 
@@ -118,6 +125,15 @@ Uses `ssh tee remote_path` with content piped via GSubprocess stdin. Binary-safe
 
 ### Connection Profiles
 Saved in `~/.config/notes-light/connections.conf` (INI format, 0600 permissions). Passwords are never saved — only key paths are persisted.
+
+### Smart Dirty Detection
+`update_dirty_state` compares current buffer text with `original_content` on every change. If the user undoes all changes (Ctrl+Z back to original), the dirty flag clears automatically and the `*` marker is removed from the title. This avoids false "unsaved changes" prompts.
+
+### Save Confirmation on Close
+When closing with unsaved changes, a `GtkAlertDialog` presents three options: Save, Don't Save, Cancel. The close request returns TRUE to block the default close until the user responds. Clean files close immediately without a prompt.
+
+### SSH Action State Management
+"Open Remote File" and "SFTP Disconnect" actions are disabled at startup and enabled/disabled via `g_simple_action_set_enabled` in `update_ssh_status`, which runs after connect and disconnect. This greys out menu items that require an active SSH connection.
 
 ## NotesWindow Struct
 

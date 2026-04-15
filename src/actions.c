@@ -1003,7 +1003,7 @@ static void on_open_remote(GSimpleAction *action, GVariant *param, gpointer data
     (void)action; (void)param;
     NotesWindow *win = data;
 
-    if (!notes_window_is_remote(win)) return;
+
 
     OpenRemoteCtx *ctx = g_new0(OpenRemoteCtx, 1);
     ctx->win = win;
