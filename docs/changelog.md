@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.1 (2026-04-15)
+
+### Performance
+- Dirty detection uses FNV-1a hash — avoids O(n) strcmp on every keystroke; full comparison only when hashes match
+- Search navigation uses stored byte offsets — O(1) jump to any match instead of O(n*k) re-scan from buffer start
+- Remote file browser (ls) runs async via GTask — no longer blocks the UI while listing directories
+
+### Fixed
+- Use-after-free in SFTP connect dialog when dialog closes during in-flight async SSH connection (ref-counted SftpCtx with dialog_alive flag)
+- GotoData memory leak when Go to Line dialog is closed without pressing Enter (freed via g_object_set_data_full on dialog)
+- match_offsets array freed in search_clear_matches and on_destroy
+
+### Security
+- Atomic file writes use g_mkstemp() (exclusive O_EXCL creation) instead of predictable .tmp suffix — prevents symlink attacks on temp files
+- connections_save() now uses atomic write (mkstemp + rename) — crash during save no longer corrupts the file
+
 ## 1.2.0 (2026-04-15)
 
 ### Added

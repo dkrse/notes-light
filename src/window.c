@@ -7,6 +7,18 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+/* FNV-1a 32-bit hash for fast dirty detection */
+guint32 fnv1a_hash(const char *data, gsize len) {
+    guint32 h = 2166136261u;
+    for (gsize i = 0; i < len; i++) {
+        h ^= (guint8)data[i];
+        h *= 16777619u;
+    }
+    return h;
+}
 
 /* Custom CSS themes */
 typedef struct {
@@ -396,12 +408,15 @@ static gboolean intensity_idle_cb(gpointer data) {
 }
 
 static void update_dirty_state(NotesWindow *win) {
-    /* Check if content matches original — if so, clear dirty */
+    /* Check if content matches original via hash — O(n) but avoids full strcmp */
     if (win->original_content) {
         GtkTextIter s, e;
         gtk_text_buffer_get_bounds(win->buffer, &s, &e);
         char *text = gtk_text_buffer_get_text(win->buffer, &s, &e, FALSE);
-        gboolean same = (strcmp(text, win->original_content) == 0);
+        gsize len = strlen(text);
+        guint32 h = fnv1a_hash(text, len);
+        /* Hash match: verify with strcmp to avoid false positives */
+        gboolean same = (h == win->original_hash) && (strcmp(text, win->original_content) == 0);
         g_free(text);
 
         if (same && win->dirty) {
@@ -697,7 +712,9 @@ void notes_window_load_file(NotesWindow *win, const char *path) {
     g_free(win->original_content);
     if (is_binary || truncated) {
         win->original_content = NULL;
+        win->original_hash = 0;
     } else {
+        win->original_hash = fnv1a_hash(contents, len);
         win->original_content = g_strndup(contents, len);
     }
 
@@ -766,23 +783,30 @@ static void auto_save_current(NotesWindow *win) {
     }
 
     if (win->current_file[0] != '\0') {
-        /* Atomic write: write to tmp, then rename */
+        /* Atomic write: write to exclusive tmp, then rename */
         char tmp[2112];
-        snprintf(tmp, sizeof(tmp), "%s.tmp", win->current_file);
-        FILE *f = fopen(tmp, "w");
-        if (f) {
-            gboolean ok = (fputs(text, f) != EOF);
-            ok = ok && (fflush(f) == 0);
-            fclose(f);
-            if (ok)
-                g_rename(tmp, win->current_file);
-            else
+        snprintf(tmp, sizeof(tmp), "%s.XXXXXX", win->current_file);
+        int fd = g_mkstemp(tmp);
+        if (fd >= 0) {
+            FILE *f = fdopen(fd, "w");
+            if (f) {
+                gboolean ok = (fputs(text, f) != EOF);
+                ok = ok && (fflush(f) == 0);
+                fclose(f);
+                if (ok)
+                    g_rename(tmp, win->current_file);
+                else
+                    g_remove(tmp);
+            } else {
+                close(fd);
                 g_remove(tmp);
+            }
         }
         snprintf(win->settings.last_file, sizeof(win->settings.last_file), "%s", win->current_file);
     }
     g_free(win->original_content);
     win->original_content = text;
+    win->original_hash = fnv1a_hash(text, strlen(text));
     win->dirty = FALSE;
 }
 
@@ -865,6 +889,7 @@ static void on_destroy(GtkWidget *widget, gpointer data) {
     g_object_unref(win->css_provider);
 
     g_free(win->match_lines);
+    g_free(win->match_offsets);
     g_free(win->original_content);
     g_free(win);
 }
@@ -898,6 +923,8 @@ static void search_clear_matches(NotesWindow *win) {
     gtk_text_buffer_remove_tag(win->buffer, win->search_tag, &s, &e);
     g_free(win->match_lines);
     win->match_lines = NULL;
+    g_free(win->match_offsets);
+    win->match_offsets = NULL;
     win->match_count = 0;
     win->match_current = -1;
 }
@@ -921,8 +948,9 @@ static void search_highlight_all(NotesWindow *win) {
         return;
     }
 
-    /* Collect all matches */
+    /* Collect all matches with positions for O(1) navigation */
     GArray *lines = g_array_new(FALSE, FALSE, sizeof(int));
+    GArray *offsets = g_array_new(FALSE, FALSE, sizeof(int));
     GtkTextIter start;
     gtk_text_buffer_get_start_iter(win->buffer, &start);
 
@@ -931,12 +959,15 @@ static void search_highlight_all(NotesWindow *win) {
                GTK_TEXT_SEARCH_CASE_INSENSITIVE, &match_start, &match_end, NULL)) {
         gtk_text_buffer_apply_tag(win->buffer, win->search_tag, &match_start, &match_end);
         int line = gtk_text_iter_get_line(&match_start);
+        int offset = gtk_text_iter_get_offset(&match_start);
         g_array_append_val(lines, line);
+        g_array_append_val(offsets, offset);
         start = match_end;
     }
 
     win->match_count = (int)lines->len;
     win->match_lines = (int *)g_array_free(lines, FALSE);
+    win->match_offsets = (int *)g_array_free(offsets, FALSE);
     win->match_current = win->match_count > 0 ? 0 : -1;
 
     search_update_label(win);
@@ -944,29 +975,21 @@ static void search_highlight_all(NotesWindow *win) {
 }
 
 static void search_goto_match(NotesWindow *win, int idx) {
-    if (win->match_count == 0 || idx < 0) return;
+    if (win->match_count == 0 || idx < 0 || !win->match_offsets) return;
 
     const char *text = gtk_editable_get_text(GTK_EDITABLE(win->search_entry));
     if (!text || text[0] == '\0') return;
 
-    GtkTextIter iter;
-    gtk_text_buffer_get_start_iter(win->buffer, &iter);
-
-    /* Walk to the idx-th match */
+    /* Jump directly to stored offset — O(1) */
     GtkTextIter ms, me;
-    int count = 0;
-    while (gtk_text_iter_forward_search(&iter, text,
-               GTK_TEXT_SEARCH_CASE_INSENSITIVE, &ms, &me, NULL)) {
-        if (count == idx) {
-            gtk_text_buffer_select_range(win->buffer, &ms, &me);
-            gtk_text_view_scroll_to_iter(win->text_view, &ms, 0.2, FALSE, 0, 0);
-            win->match_current = idx;
-            search_update_label(win);
-            return;
-        }
-        count++;
-        iter = me;
-    }
+    gtk_text_buffer_get_iter_at_offset(win->buffer, &ms, win->match_offsets[idx]);
+    glong search_len = g_utf8_strlen(text, -1);
+    me = ms;
+    gtk_text_iter_forward_chars(&me, (gint)search_len);
+    gtk_text_buffer_select_range(win->buffer, &ms, &me);
+    gtk_text_view_scroll_to_iter(win->text_view, &ms, 0.2, FALSE, 0, 0);
+    win->match_current = idx;
+    search_update_label(win);
 }
 
 static void on_search_changed(GtkEditable *editable, gpointer data) {
@@ -1152,10 +1175,7 @@ static void on_goto_activate(GtkEntry *e, gpointer data) {
     gtk_window_destroy(GTK_WINDOW(gd->dialog));
 }
 
-static void on_goto_data_free(gpointer data, GClosure *c) {
-    (void)c;
-    g_free(data);
-}
+/* GotoData is freed via g_object_set_data_full on the dialog */
 
 static gboolean on_goto_key(GtkEventControllerKey *ctrl, guint keyval,
                              guint keycode, GdkModifierType state, gpointer data) {
@@ -1200,13 +1220,14 @@ void notes_window_goto_line(NotesWindow *win) {
     gd->entry = entry;
     gd->dialog = dialog;
 
-    g_signal_connect_data(entry, "activate",
-        G_CALLBACK(on_goto_activate), gd,
-        on_goto_data_free, 0);
+    g_signal_connect(entry, "activate", G_CALLBACK(on_goto_activate), gd);
 
     GtkEventController *key = gtk_event_controller_key_new();
     g_signal_connect(key, "key-pressed", G_CALLBACK(on_goto_key), gd);
     gtk_widget_add_controller(dialog, key);
+
+    /* Free GotoData when dialog is destroyed (covers close-without-Enter) */
+    g_object_set_data_full(G_OBJECT(dialog), "goto-data", gd, g_free);
 
     gtk_window_present(GTK_WINDOW(dialog));
     gtk_widget_grab_focus(entry);
@@ -1313,6 +1334,7 @@ void notes_window_open_remote_file(NotesWindow *win, const char *remote_path) {
 
     g_free(win->original_content);
     win->original_content = contents;
+    win->original_hash = fnv1a_hash(contents, len);
     win->is_binary = is_binary;
     win->is_truncated = FALSE;
     win->dirty = FALSE;
@@ -1366,6 +1388,7 @@ gboolean save_remote_file(NotesWindow *win) {
     if (ok) {
         g_free(win->original_content);
         win->original_content = text;
+        win->original_hash = fnv1a_hash(text, len);
         win->dirty = FALSE;
 
         char *base = g_path_get_basename(remote);

@@ -31,6 +31,7 @@ typedef struct {
     gboolean              is_binary;
     gboolean              is_truncated;
     char                 *original_content;
+    guint32               original_hash;
 
     /* SSH/SFTP state */
     char                  ssh_host[256];
@@ -53,10 +54,12 @@ typedef struct {
     GtkWidget            *scrolled_window;
     GtkWidget            *scrollbar_overlay;
     int                  *match_lines;
+    int                  *match_offsets;  /* byte offsets of each match start */
     int                   match_count;
     int                   match_current;
 } NotesWindow;
 
+guint32      fnv1a_hash(const char *data, gsize len);
 NotesWindow *notes_window_new(GtkApplication *app);
 void         notes_window_apply_settings(NotesWindow *win);
 void         notes_window_load_file(NotesWindow *win, const char *path);

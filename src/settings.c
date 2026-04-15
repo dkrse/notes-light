@@ -141,9 +141,17 @@ void connections_load(SftpConnections *c) {
 
 void connections_save(const SftpConnections *c) {
     ensure_config_dir();
-    FILE *f = fopen(connections_get_path(), "w");
-    if (!f) return;
-    fchmod(fileno(f), 0600);
+    char *path = connections_get_path();
+
+    /* Atomic write: write to exclusive tmp, then rename */
+    char tmp[1088];
+    snprintf(tmp, sizeof(tmp), "%s.XXXXXX", path);
+    int fd = g_mkstemp(tmp);
+    if (fd < 0) return;
+    fchmod(fd, 0600);
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); g_remove(tmp); return; }
+
     for (int i = 0; i < c->count; i++) {
         const SftpConnection *s = &c->items[i];
         fprintf(f, "[%s]\n", s->name);
@@ -155,7 +163,13 @@ void connections_save(const SftpConnections *c) {
         fprintf(f, "key_path=%s\n", s->key_path);
         fprintf(f, "\n");
     }
+
+    gboolean ok = (fflush(f) == 0);
     fclose(f);
+    if (ok)
+        g_rename(tmp, path);
+    else
+        g_remove(tmp);
 }
 
 void settings_save(const NotesSettings *s) {

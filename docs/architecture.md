@@ -41,7 +41,7 @@ Startup:
 
 Editing:
   keystroke → GtkTextBuffer "changed" signal
-    → update_dirty_state (compare with original_content;
+    → update_dirty_state (FNV-1a hash compare; full strcmp only on hash match;
         set dirty + " *" if different, clear dirty if same)
     → update_line_numbers (idle scheduled)
     → update_cursor_position (status bar Ln/Col)
@@ -62,7 +62,7 @@ File Load (remote):
     → virtual path stored as /tmp/note-light-sftp-PID-user@host/path
 
 Save (local):
-  get buffer text → fopen tmp → fputs → fflush → rename over original
+  get buffer text → g_mkstemp (exclusive tmp) → fputs → fflush → rename over original
 
 Save (remote):
   ssh_write_file (GSubprocess: ssh tee remote_path < stdin)
@@ -70,9 +70,9 @@ Save (remote):
 Search:
   on_search_changed → search_highlight_all (forward_search loop)
     → apply search-match tag to all matches
-    → collect match line numbers for scrollbar markers
+    → collect match line numbers + byte offsets for scrollbar markers and O(1) navigation
     → draw_scrollbar_markers (GtkDrawingArea overlay on scrollbar)
-  Enter/Shift+Enter → search_goto_match (next/prev)
+  Enter/Shift+Enter → search_goto_match (jump via stored offset, O(1))
 
 SFTP Connect:
   SFTP dialog → form (host/port/user/key/path) → GTask ssh_connect_thread
@@ -80,8 +80,8 @@ SFTP Connect:
     → notes_window_ssh_connect → ssh_ctl_start (ControlMaster)
 
 Remote File Browser:
-  Open Remote File dialog → ssh ls -1pA /path (sync via ControlMaster)
-    → populate GtkListBox (dirs first, then files)
+  Open Remote File dialog → ssh ls -1pA /path (async via GTask + ControlMaster)
+    → show "Loading..." → populate GtkListBox (dirs first, then files)
     → click dir → navigate, click file → notes_window_open_remote_file
 
 Close:
@@ -108,7 +108,7 @@ GtkTextBuffer is not designed for 100+ MB files. Large files are truncated to 5 
 First 8 KB scanned for NUL bytes. NUL bytes replaced with '.'. Non-UTF-8 content converted via ISO-8859-1 fallback.
 
 ### Atomic Writes
-All file writes (content, settings) use tmp + rename pattern. A crash during write never corrupts the original file.
+All file writes (content, settings, connection profiles) use exclusive tmp file via `g_mkstemp()` + rename pattern. The exclusive creation (`O_EXCL`) prevents symlink attacks on the tmp file. A crash during write never corrupts the original file.
 
 ### CSS Injection Protection
 Font names from config are sanitized via `css_escape_font()` which strips `} { ; " ' \` before embedding into CSS strings.
@@ -123,10 +123,10 @@ Uses GtkSourceView 5. The text view is a custom subclass of GtkSourceView (inste
 When syntax highlighting is off: applied as a text tag with alpha-channel foreground color on the entire buffer. When syntax highlighting is on: applied as CSS opacity on the text view widget (preserving syntax colors). Re-applied after file load and on buffer changes via idle callback.
 
 ### Search with Scrollbar Markers
-Search highlights all matches with a GtkTextTag. Match line numbers are collected and drawn as orange markers on a GtkDrawingArea overlay positioned at the right edge of the scrolled window.
+Search highlights all matches with a GtkTextTag. Match line numbers and byte offsets are collected during the highlight pass. Navigation to a specific match uses stored offsets via `gtk_text_buffer_get_iter_at_offset` for O(1) jumps instead of re-scanning from the start. Match positions are drawn as orange markers on a GtkDrawingArea overlay positioned at the right edge of the scrolled window.
 
 ### SSH/SFTP Without External Libraries
-Uses the system `ssh` command via `g_spawn_sync` / `GSubprocess`. No libssh/libssh2 dependency. SSH ControlMaster multiplexes all commands through a single TCP connection (near-zero overhead per command). Connection test runs async via GTask to avoid blocking the UI. Remote file paths use a virtual mount prefix (`/tmp/note-light-sftp-PID-user@host`) for `ssh_path_is_remote()` detection.
+Uses the system `ssh` command via `g_spawn_sync` / `GSubprocess`. No libssh/libssh2 dependency. SSH ControlMaster multiplexes all commands through a single TCP connection (near-zero overhead per command). Connection test and remote directory listing run async via GTask to avoid blocking the UI. The SFTP dialog uses ref-counted `SftpCtx` with a `dialog_alive` flag to prevent use-after-free when the dialog closes during an in-flight async connect. Remote file paths use a virtual mount prefix (`/tmp/note-light-sftp-PID-user@host`) for `ssh_path_is_remote()` detection.
 
 ### Remote File Save
 Uses `ssh tee remote_path` with content piped via GSubprocess stdin. Binary-safe.
@@ -135,7 +135,7 @@ Uses `ssh tee remote_path` with content piped via GSubprocess stdin. Binary-safe
 Saved in `~/.config/notes-light/connections.conf` (INI format, 0600 permissions). Passwords are never saved — only key paths are persisted.
 
 ### Smart Dirty Detection
-`update_dirty_state` compares current buffer text with `original_content` on every change. If the user undoes all changes (Ctrl+Z back to original), the dirty flag clears automatically and the `*` marker is removed from the title. This avoids false "unsaved changes" prompts.
+`update_dirty_state` uses FNV-1a 32-bit hash to quickly detect whether the buffer has changed. On each keystroke, the current buffer is hashed and compared with `original_hash`. Only when hashes match is the full `strcmp` performed to rule out false positives. This avoids O(n) string comparison on every keystroke for the common case where the content has changed. If the user undoes all changes (Ctrl+Z back to original), the dirty flag clears automatically and the `*` marker is removed from the title.
 
 ### Save Confirmation on Close
 When closing with unsaved changes, a `GtkAlertDialog` presents three options: Save, Don't Save, Cancel. The close request returns TRUE to block the default close until the user responds. Clean files close immediately without a prompt.
@@ -149,11 +149,11 @@ Central state object, heap-allocated via `g_new0`. Holds:
 - GTK widget pointers (window, source_view, source_buffer, text_view/buffer aliases, line_numbers, labels)
 - Settings struct (inline, not pointer)
 - CSS provider
-- File state (current_file path, dirty flag, is_binary, is_truncated, original_content)
+- File state (current_file path, dirty flag, is_binary, is_truncated, original_content, original_hash)
 - Idle source IDs (line_numbers, intensity, scroll, title)
 - Current line highlight state (line number, RGBA color)
 - SSH state (host, user, port, key, remote_path, mount, ctl_path, ctl_dir, status button)
-- Search state (search_bar, entries, search_tag, match_lines, match_count, scrollbar_overlay)
+- Search state (search_bar, entries, search_tag, match_lines, match_offsets, match_count, scrollbar_overlay)
 
 Freed in `on_destroy` after all idle sources are cancelled and SSH is disconnected.
 

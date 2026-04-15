@@ -21,11 +21,12 @@ Fast, minimal text editor written in C with GTK 4 and libadwaita.
 - Persistent settings (~/.config/notes-light/settings.conf)
 - Saved SSH connection profiles (~/.config/notes-light/connections.conf)
 - Save confirmation dialog on close with unsaved changes (Save / Don't Save / Cancel)
-- Smart dirty detection (undo back to original clears dirty flag)
+- Smart dirty detection with FNV-1a hashing (undo back to original clears dirty flag)
 - Auto-restore last opened file
-- Atomic file writes (tmp + rename)
+- Atomic file writes (exclusive tmp via mkstemp + rename)
 - CSS injection protection
 - Full theme support for all dialogs
+- Async remote file browsing (non-blocking UI)
 
 ## Dependencies
 

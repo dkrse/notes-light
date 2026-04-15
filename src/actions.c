@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 
 /* --- Theme list --- */
@@ -41,6 +42,7 @@ static void on_new_file(GSimpleAction *action, GVariant *param, gpointer data) {
 
     g_free(win->original_content);
     win->original_content = g_strdup("");
+    win->original_hash = fnv1a_hash("", 0);
     gtk_text_buffer_set_text(win->buffer, "", -1);
     win->dirty = FALSE;
     win->is_binary = FALSE;
@@ -74,16 +76,22 @@ static void on_save(GSimpleAction *action, GVariant *param, gpointer data) {
 
     if (win->current_file[0] != '\0') {
         char tmp[2112];
-        snprintf(tmp, sizeof(tmp), "%s.tmp", win->current_file);
-        FILE *f = fopen(tmp, "w");
-        if (f) {
-            gboolean ok = (fputs(text, f) != EOF);
-            ok = ok && (fflush(f) == 0);
-            fclose(f);
-            if (ok)
-                g_rename(tmp, win->current_file);
-            else
+        snprintf(tmp, sizeof(tmp), "%s.XXXXXX", win->current_file);
+        int fd = g_mkstemp(tmp);
+        if (fd >= 0) {
+            FILE *f = fdopen(fd, "w");
+            if (f) {
+                gboolean ok = (fputs(text, f) != EOF);
+                ok = ok && (fflush(f) == 0);
+                fclose(f);
+                if (ok)
+                    g_rename(tmp, win->current_file);
+                else
+                    g_remove(tmp);
+            } else {
+                close(fd);
                 g_remove(tmp);
+            }
         }
     } else {
         g_free(text);
@@ -92,6 +100,7 @@ static void on_save(GSimpleAction *action, GVariant *param, gpointer data) {
     }
     g_free(win->original_content);
     win->original_content = text;
+    win->original_hash = fnv1a_hash(text, strlen(text));
     win->dirty = FALSE;
     win->is_binary = FALSE;
 
@@ -111,24 +120,31 @@ static void on_save_as_cb(GObject *source, GAsyncResult *result, gpointer data) 
             gtk_text_buffer_get_bounds(win->buffer, &start, &end);
             char *text = gtk_text_buffer_get_text(win->buffer, &start, &end, FALSE);
 
-            /* Atomic write */
+            /* Atomic write with exclusive tmp */
             char tmp[2112];
-            snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-            FILE *f = fopen(tmp, "w");
-            if (f) {
-                gboolean ok = (fputs(text, f) != EOF);
-                ok = ok && (fflush(f) == 0);
-                fclose(f);
-                if (ok)
-                    g_rename(tmp, path);
-                else
+            snprintf(tmp, sizeof(tmp), "%s.XXXXXX", path);
+            int fd = g_mkstemp(tmp);
+            if (fd >= 0) {
+                FILE *f = fdopen(fd, "w");
+                if (f) {
+                    gboolean ok = (fputs(text, f) != EOF);
+                    ok = ok && (fflush(f) == 0);
+                    fclose(f);
+                    if (ok)
+                        g_rename(tmp, path);
+                    else
+                        g_remove(tmp);
+                } else {
+                    close(fd);
                     g_remove(tmp);
+                }
             }
 
             snprintf(win->current_file, sizeof(win->current_file), "%s", path);
             snprintf(win->settings.last_file, sizeof(win->settings.last_file), "%s", path);
             g_free(win->original_content);
             win->original_content = text;
+            win->original_hash = fnv1a_hash(text, strlen(text));
             win->dirty = FALSE;
             settings_save(&win->settings);
 
@@ -439,7 +455,19 @@ typedef struct {
     GtkWidget       *key_row;
     GtkWidget       *key_btn_row;
     int              selected_idx;
+    int              ref_count;       /* prevent use-after-free during async connect */
+    gboolean         dialog_alive;    /* FALSE after dialog destroy */
 } SftpCtx;
+
+static SftpCtx *sftp_ctx_ref(SftpCtx *ctx) {
+    ctx->ref_count++;
+    return ctx;
+}
+
+static void sftp_ctx_unref(SftpCtx *ctx) {
+    if (--ctx->ref_count <= 0)
+        g_free(ctx);
+}
 
 static void sftp_populate_list(SftpCtx *ctx) {
     GtkWidget *child;
@@ -636,17 +664,23 @@ static void ssh_connect_done(GObject *src, GAsyncResult *res, gpointer data) {
     GError *err = NULL;
 
     if (!g_task_propagate_boolean(G_TASK(res), &err)) {
-        gtk_widget_set_sensitive(d->connect_btn, TRUE);
-        gtk_button_set_label(GTK_BUTTON(d->connect_btn), "Connect");
-        GtkAlertDialog *alert = gtk_alert_dialog_new("%s", err->message);
-        gtk_alert_dialog_show(alert, ctx->dialog);
-        g_object_unref(alert);
+        if (ctx->dialog_alive) {
+            gtk_widget_set_sensitive(d->connect_btn, TRUE);
+            gtk_button_set_label(GTK_BUTTON(d->connect_btn), "Connect");
+            GtkAlertDialog *alert = gtk_alert_dialog_new("%s", err->message);
+            gtk_alert_dialog_show(alert, ctx->dialog);
+            g_object_unref(alert);
+        }
         g_error_free(err);
+        sftp_ctx_unref(ctx);
         return;
     }
 
     notes_window_ssh_connect(ctx->win, d->host, d->user, d->port, d->key, d->remote);
-    gtk_window_destroy(GTK_WINDOW(ctx->dialog));
+    if (ctx->dialog_alive)
+        gtk_window_destroy(GTK_WINDOW(ctx->dialog));
+    /* Release the task's ref (dialog destroy releases the dialog's ref) */
+    sftp_ctx_unref(ctx);
 }
 
 static void on_sftp_connect(GtkButton *btn, gpointer data) {
@@ -689,7 +723,7 @@ static void on_sftp_connect(GtkButton *btn, gpointer data) {
     g_ptr_array_add(av, g_strdup("ok"));
 
     ConnectTaskData *td = g_new0(ConnectTaskData, 1);
-    td->ctx = ctx;
+    td->ctx = sftp_ctx_ref(ctx);  /* prevent use-after-free if dialog closes */
     td->argv = av;
     td->connect_btn = GTK_WIDGET(btn);
     g_strlcpy(td->host, host, sizeof(td->host));
@@ -709,7 +743,9 @@ static void on_sftp_connect(GtkButton *btn, gpointer data) {
 
 static void on_sftp_dialog_destroy(GtkWidget *widget, gpointer data) {
     (void)widget;
-    g_free(data);
+    SftpCtx *ctx = data;
+    ctx->dialog_alive = FALSE;
+    sftp_ctx_unref(ctx);
 }
 
 static void on_sftp_dialog(GSimpleAction *action, GVariant *param, gpointer data) {
@@ -719,6 +755,8 @@ static void on_sftp_dialog(GSimpleAction *action, GVariant *param, gpointer data
     SftpCtx *ctx = g_new0(SftpCtx, 1);
     ctx->win = win;
     ctx->selected_idx = -1;
+    ctx->ref_count = 1;       /* owned by dialog destroy */
+    ctx->dialog_alive = TRUE;
     connections_load(&ctx->conns);
 
     GtkWidget *dialog = gtk_window_new();
@@ -911,30 +949,36 @@ static void on_remote_row_activated(GtkListBox *box, GtkListBoxRow *row, gpointe
     gtk_window_destroy(GTK_WINDOW(ctx->dialog));
 }
 
-static void remote_browse_populate(OpenRemoteCtx *ctx) {
-    /* Update path label */
-    char label_text[512];
-    snprintf(label_text, sizeof(label_text), "%s@%s:%s",
-             ctx->win->ssh_user, ctx->win->ssh_host, ctx->current_dir);
-    gtk_label_set_text(ctx->path_label, label_text);
+typedef struct {
+    GPtrArray *argv;
+    char      *stdout_buf;
+    gboolean   ok;
+} BrowseTaskData;
 
-    /* Clear list */
+static void browse_task_data_free(gpointer p) {
+    BrowseTaskData *d = p;
+    if (d->argv) g_ptr_array_unref(d->argv);
+    g_free(d->stdout_buf);
+    g_free(d);
+}
+
+static void browse_thread(GTask *task, gpointer src, gpointer data,
+                           GCancellable *cancel) {
+    (void)src; (void)cancel;
+    BrowseTaskData *d = data;
+    d->ok = ssh_spawn_sync(d->argv, &d->stdout_buf, NULL);
+    g_task_return_boolean(task, TRUE);
+}
+
+static void browse_done(GObject *src, GAsyncResult *res, gpointer data) {
+    (void)src;
+    OpenRemoteCtx *ctx = data;
+    BrowseTaskData *d = g_task_get_task_data(G_TASK(res));
+
+    /* Clear loading indicator */
     GtkWidget *child;
     while ((child = gtk_widget_get_first_child(GTK_WIDGET(ctx->file_list))))
         gtk_list_box_remove(ctx->file_list, child);
-
-    /* Run: ssh user@host -- ls -1pA /path */
-    GPtrArray *av = ssh_argv_new(ctx->win->ssh_host, ctx->win->ssh_user,
-                                  ctx->win->ssh_port, ctx->win->ssh_key,
-                                  ctx->win->ssh_ctl_path);
-    g_ptr_array_add(av, g_strdup("--"));
-    g_ptr_array_add(av, g_strdup("ls"));
-    g_ptr_array_add(av, g_strdup("-1pA"));
-    g_ptr_array_add(av, g_strdup(ctx->current_dir));
-
-    char *stdout_buf = NULL;
-    gboolean ok = ssh_spawn_sync(av, &stdout_buf, NULL);
-    g_ptr_array_unref(av);
 
     /* Always show ".." unless at root */
     if (strcmp(ctx->current_dir, "/") != 0) {
@@ -946,10 +990,9 @@ static void remote_browse_populate(OpenRemoteCtx *ctx) {
         gtk_list_box_append(ctx->file_list, lbl);
     }
 
-    if (!ok || !stdout_buf) {
+    if (!d->ok || !d->stdout_buf) {
         GtkWidget *lbl = gtk_label_new("(failed to list directory)");
         gtk_list_box_append(ctx->file_list, lbl);
-        g_free(stdout_buf);
         return;
     }
 
@@ -957,7 +1000,7 @@ static void remote_browse_populate(OpenRemoteCtx *ctx) {
     GPtrArray *dirs = g_ptr_array_new_with_free_func(g_free);
     GPtrArray *files = g_ptr_array_new_with_free_func(g_free);
 
-    char **lines = g_strsplit(stdout_buf, "\n", -1);
+    char **lines = g_strsplit(d->stdout_buf, "\n", -1);
     for (int i = 0; lines[i]; i++) {
         if (lines[i][0] == '\0') continue;
         size_t len = strlen(lines[i]);
@@ -967,7 +1010,6 @@ static void remote_browse_populate(OpenRemoteCtx *ctx) {
             g_ptr_array_add(files, g_strdup(lines[i]));
     }
     g_strfreev(lines);
-    g_free(stdout_buf);
 
     /* Add directories */
     for (guint i = 0; i < dirs->len; i++) {
@@ -993,6 +1035,40 @@ static void remote_browse_populate(OpenRemoteCtx *ctx) {
 
     g_ptr_array_unref(dirs);
     g_ptr_array_unref(files);
+}
+
+static void remote_browse_populate(OpenRemoteCtx *ctx) {
+    /* Update path label */
+    char label_text[512];
+    snprintf(label_text, sizeof(label_text), "%s@%s:%s",
+             ctx->win->ssh_user, ctx->win->ssh_host, ctx->current_dir);
+    gtk_label_set_text(ctx->path_label, label_text);
+
+    /* Clear list */
+    GtkWidget *child;
+    while ((child = gtk_widget_get_first_child(GTK_WIDGET(ctx->file_list))))
+        gtk_list_box_remove(ctx->file_list, child);
+
+    /* Show loading indicator */
+    GtkWidget *loading = gtk_label_new("Loading...");
+    gtk_list_box_append(ctx->file_list, loading);
+
+    /* Run SSH ls asynchronously to avoid blocking UI */
+    GPtrArray *av = ssh_argv_new(ctx->win->ssh_host, ctx->win->ssh_user,
+                                  ctx->win->ssh_port, ctx->win->ssh_key,
+                                  ctx->win->ssh_ctl_path);
+    g_ptr_array_add(av, g_strdup("--"));
+    g_ptr_array_add(av, g_strdup("ls"));
+    g_ptr_array_add(av, g_strdup("-1pA"));
+    g_ptr_array_add(av, g_strdup(ctx->current_dir));
+
+    BrowseTaskData *d = g_new0(BrowseTaskData, 1);
+    d->argv = av;
+
+    GTask *task = g_task_new(NULL, NULL, browse_done, ctx);
+    g_task_set_task_data(task, d, browse_task_data_free);
+    g_task_run_in_thread(task, browse_thread);
+    g_object_unref(task);
 }
 
 static void on_open_remote_destroy(GtkWidget *w, gpointer data) {
