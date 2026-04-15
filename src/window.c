@@ -2,6 +2,7 @@
 #include <adwaita.h>
 #include "window.h"
 #include "actions.h"
+#include "ssh.h"
 #include <glib/gstdio.h>
 #include <stdio.h>
 #include <string.h>
@@ -163,7 +164,7 @@ static void apply_css(NotesWindow *win) {
             "  background: alpha(%s, 0.1); }"
             ".statusbar { font-size: 10pt; padding: 2px 4px;"
             "  color: alpha(%s, 0.6); background-color: %s; }"
-            "window, window.background { background-color: %s; }"
+            "window, window.background { background-color: %s; color: %s; }"
             "popover, popover.menu {"
             "  background: transparent; box-shadow: none; border: none; }"
             "popover > contents, popover.menu > contents {"
@@ -172,7 +173,19 @@ static void apply_css(NotesWindow *win) {
             "popover > arrow, popover.menu > arrow { background: transparent; border: none; }"
             "popover modelbutton { color: %s; }"
             "popover modelbutton:hover { background-color: alpha(%s, 0.15); }"
-            "windowcontrols button { color: %s; }",
+            "windowcontrols button { color: %s; }"
+            /* Dialog widgets */
+            "label { color: %s; }"
+            "entry { background-color: alpha(%s, 0.08); color: %s;"
+            "  border: 1px solid alpha(%s, 0.2); }"
+            "button { color: %s; }"
+            "checkbutton { color: %s; }"
+            "scale { color: %s; }"
+            "list, listview, row { background-color: %s; color: %s; }"
+            "row:hover { background-color: alpha(%s, 0.08); }"
+            "row:selected { background-color: alpha(%s, 0.15); }"
+            "scrolledwindow { background-color: %s; }"
+            "separator { background-color: alpha(%s, 0.15); }",
             safe_font, win->settings.font_size, bg,
             bg, fg,
             bg, fg,
@@ -180,10 +193,22 @@ static void apply_css(NotesWindow *win) {
             fg,
             fg,
             fg, bg,
-            bg,
+            bg, fg,
             bg, fg,
             fg,
             fg,
+            fg,
+            /* Dialog widgets */
+            fg,
+            fg, fg,
+            fg,
+            fg,
+            fg,
+            fg,
+            bg, fg,
+            fg,
+            fg,
+            bg,
             fg);
     } else {
         const char *bg, *fg;
@@ -449,16 +474,8 @@ static void apply_font_intensity(NotesWindow *win) {
     color.alpha = alpha;
     g_object_set(win->intensity_tag, "foreground-rgba", &color, NULL);
 
-    /* Only tag visible range + margin to avoid O(n) on entire buffer */
-    GdkRectangle visible;
-    gtk_text_view_get_visible_rect(win->text_view, &visible);
-
     GtkTextIter start, end;
-    gtk_text_view_get_iter_at_location(win->text_view, &start,
-                                       visible.x, visible.y - 200);
-    gtk_text_view_get_iter_at_location(win->text_view, &end,
-                                       visible.x, visible.y + visible.height + 200);
-
+    gtk_text_buffer_get_bounds(win->buffer, &start, &end);
     gtk_text_buffer_apply_tag(win->buffer, win->intensity_tag, &start, &end);
 }
 
@@ -601,6 +618,7 @@ void notes_window_load_file(NotesWindow *win, const char *path) {
     if (win->settings.show_line_numbers)
         update_line_numbers(win->buffer, win);
     update_line_highlights(win);
+    apply_font_intensity(win);
 
     settings_save(&win->settings);
 }
@@ -644,8 +662,12 @@ static gboolean on_close_request(GtkWindow *window, gpointer data) {
     NotesWindow *win = data;
     auto_save_current(win);
 
-    /* Always sync current_file → last_file before saving settings */
-    if (win->current_file[0] != '\0')
+    /* Disconnect SSH if active */
+    if (notes_window_is_remote(win))
+        notes_window_ssh_disconnect(win);
+
+    /* Don't save remote path as last_file */
+    if (win->current_file[0] != '\0' && !ssh_path_is_remote(win->current_file))
         snprintf(win->settings.last_file, sizeof(win->settings.last_file),
                  "%s", win->current_file);
 
@@ -680,16 +702,23 @@ static void on_destroy(GtkWidget *widget, gpointer data) {
         GTK_STYLE_PROVIDER(win->css_provider));
     g_object_unref(win->css_provider);
 
+    g_free(win->match_lines);
     g_free(win->original_content);
     g_free(win);
 }
 
 static GtkWidget *build_menu_button(void) {
     GMenu *menu = g_menu_new();
+    g_menu_append(menu, "New", "win.new-file");
     g_menu_append(menu, "Open File", "win.open-file");
     g_menu_append(menu, "Save", "win.save");
     g_menu_append(menu, "Save As...", "win.save-as");
-    g_menu_append(menu, "New", "win.new-file");
+    g_menu_append(menu, "Find", "win.find");
+    g_menu_append(menu, "Find & Replace", "win.find-replace");
+    g_menu_append(menu, "Go to Line", "win.goto-line");
+    g_menu_append(menu, "SFTP Connect...", "win.sftp-connect");
+    g_menu_append(menu, "Open Remote File", "win.open-remote");
+    g_menu_append(menu, "SFTP Disconnect", "win.sftp-disconnect");
     g_menu_append(menu, "Settings", "win.settings");
 
     GtkWidget *button = gtk_menu_button_new();
@@ -697,6 +726,488 @@ static GtkWidget *build_menu_button(void) {
     gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(button), G_MENU_MODEL(menu));
     g_object_unref(menu);
     return button;
+}
+
+/* ── Search / Replace / Go-to-line ────────────────────────────── */
+
+static void search_clear_matches(NotesWindow *win) {
+    GtkTextIter s, e;
+    gtk_text_buffer_get_bounds(win->buffer, &s, &e);
+    gtk_text_buffer_remove_tag(win->buffer, win->search_tag, &s, &e);
+    g_free(win->match_lines);
+    win->match_lines = NULL;
+    win->match_count = 0;
+    win->match_current = -1;
+}
+
+static void search_update_label(NotesWindow *win) {
+    char buf[64];
+    if (win->match_count == 0)
+        snprintf(buf, sizeof(buf), "No results");
+    else
+        snprintf(buf, sizeof(buf), "%d of %d", win->match_current + 1, win->match_count);
+    gtk_label_set_text(GTK_LABEL(win->match_label), buf);
+}
+
+static void search_highlight_all(NotesWindow *win) {
+    search_clear_matches(win);
+
+    const char *text = gtk_editable_get_text(GTK_EDITABLE(win->search_entry));
+    if (!text || text[0] == '\0') {
+        search_update_label(win);
+        gtk_widget_queue_draw(win->scrollbar_overlay);
+        return;
+    }
+
+    /* Collect all matches */
+    GArray *lines = g_array_new(FALSE, FALSE, sizeof(int));
+    GtkTextIter start;
+    gtk_text_buffer_get_start_iter(win->buffer, &start);
+
+    GtkTextIter match_start, match_end;
+    while (gtk_text_iter_forward_search(&start, text,
+               GTK_TEXT_SEARCH_CASE_INSENSITIVE, &match_start, &match_end, NULL)) {
+        gtk_text_buffer_apply_tag(win->buffer, win->search_tag, &match_start, &match_end);
+        int line = gtk_text_iter_get_line(&match_start);
+        g_array_append_val(lines, line);
+        start = match_end;
+    }
+
+    win->match_count = (int)lines->len;
+    win->match_lines = (int *)g_array_free(lines, FALSE);
+    win->match_current = win->match_count > 0 ? 0 : -1;
+
+    search_update_label(win);
+    gtk_widget_queue_draw(win->scrollbar_overlay);
+}
+
+static void search_goto_match(NotesWindow *win, int idx) {
+    if (win->match_count == 0 || idx < 0) return;
+
+    const char *text = gtk_editable_get_text(GTK_EDITABLE(win->search_entry));
+    if (!text || text[0] == '\0') return;
+
+    GtkTextIter iter;
+    gtk_text_buffer_get_start_iter(win->buffer, &iter);
+
+    /* Walk to the idx-th match */
+    GtkTextIter ms, me;
+    int count = 0;
+    while (gtk_text_iter_forward_search(&iter, text,
+               GTK_TEXT_SEARCH_CASE_INSENSITIVE, &ms, &me, NULL)) {
+        if (count == idx) {
+            gtk_text_buffer_select_range(win->buffer, &ms, &me);
+            gtk_text_view_scroll_to_iter(win->text_view, &ms, 0.2, FALSE, 0, 0);
+            win->match_current = idx;
+            search_update_label(win);
+            return;
+        }
+        count++;
+        iter = me;
+    }
+}
+
+static void on_search_changed(GtkEditable *editable, gpointer data) {
+    (void)editable;
+    NotesWindow *win = data;
+    search_highlight_all(win);
+    if (win->match_count > 0)
+        search_goto_match(win, 0);
+}
+
+static void on_search_next(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    NotesWindow *win = data;
+    if (win->match_count == 0) return;
+    int next = (win->match_current + 1) % win->match_count;
+    search_goto_match(win, next);
+}
+
+static void on_search_prev(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    NotesWindow *win = data;
+    if (win->match_count == 0) return;
+    int prev = (win->match_current - 1 + win->match_count) % win->match_count;
+    search_goto_match(win, prev);
+}
+
+static void search_bar_close(NotesWindow *win) {
+    search_clear_matches(win);
+    gtk_widget_set_visible(win->search_bar, FALSE);
+    gtk_widget_queue_draw(win->scrollbar_overlay);
+    gtk_widget_grab_focus(GTK_WIDGET(win->text_view));
+}
+
+static void on_search_close(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    search_bar_close(data);
+}
+
+static void on_replace_one(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    NotesWindow *win = data;
+    if (win->match_count == 0 || win->match_current < 0) return;
+
+    const char *find = gtk_editable_get_text(GTK_EDITABLE(win->search_entry));
+    const char *repl = gtk_editable_get_text(GTK_EDITABLE(win->replace_entry));
+    if (!find || find[0] == '\0') return;
+
+    /* Get current selection — it should be the current match */
+    GtkTextIter sel_start, sel_end;
+    if (gtk_text_buffer_get_selection_bounds(win->buffer, &sel_start, &sel_end)) {
+        gtk_text_buffer_delete(win->buffer, &sel_start, &sel_end);
+        gtk_text_buffer_insert(win->buffer, &sel_start, repl, -1);
+    }
+
+    search_highlight_all(win);
+    if (win->match_count > 0) {
+        if (win->match_current >= win->match_count)
+            win->match_current = 0;
+        search_goto_match(win, win->match_current);
+    }
+}
+
+static void on_replace_all(GtkWidget *widget, gpointer data) {
+    (void)widget;
+    NotesWindow *win = data;
+
+    const char *find = gtk_editable_get_text(GTK_EDITABLE(win->search_entry));
+    const char *repl = gtk_editable_get_text(GTK_EDITABLE(win->replace_entry));
+    if (!find || find[0] == '\0') return;
+
+    GtkTextIter start;
+    gtk_text_buffer_get_start_iter(win->buffer, &start);
+
+    int replaced = 0;
+    GtkTextIter ms, me;
+    gtk_text_buffer_begin_user_action(win->buffer);
+    while (gtk_text_iter_forward_search(&start, find,
+               GTK_TEXT_SEARCH_CASE_INSENSITIVE, &ms, &me, NULL)) {
+        gtk_text_buffer_delete(win->buffer, &ms, &me);
+        gtk_text_buffer_insert(win->buffer, &ms, repl, -1);
+        start = ms;
+        replaced++;
+    }
+    gtk_text_buffer_end_user_action(win->buffer);
+
+    search_highlight_all(win);
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Replaced %d", replaced);
+    gtk_label_set_text(GTK_LABEL(win->match_label), buf);
+}
+
+/* Scrollbar match markers overlay */
+static void draw_scrollbar_markers(GtkDrawingArea *area, cairo_t *cr,
+                                    int width, int height, gpointer data) {
+    (void)area;
+    NotesWindow *win = data;
+    if (win->match_count == 0) return;
+
+    int total_lines = gtk_text_buffer_get_line_count(win->buffer);
+    if (total_lines <= 0) return;
+
+    /* Determine theme-aware marker color */
+    gboolean dark = is_dark_theme(win->settings.theme);
+    if (dark)
+        cairo_set_source_rgba(cr, 1.0, 0.7, 0.2, 0.9);
+    else
+        cairo_set_source_rgba(cr, 1.0, 0.5, 0.0, 0.9);
+
+    double marker_h = 2.0;
+    for (int i = 0; i < win->match_count; i++) {
+        double y = ((double)win->match_lines[i] / total_lines) * height;
+        cairo_rectangle(cr, 0, y, width, marker_h);
+        cairo_fill(cr);
+    }
+}
+
+static gboolean on_search_entry_key(GtkEventControllerKey *ctrl,
+                                     guint keyval, guint keycode,
+                                     GdkModifierType state, gpointer data) {
+    (void)ctrl; (void)keycode;
+    NotesWindow *win = data;
+    if (keyval == GDK_KEY_Escape) {
+        search_bar_close(win);
+        return TRUE;
+    }
+    if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+        if (state & GDK_SHIFT_MASK)
+            on_search_prev(NULL, win);
+        else
+            on_search_next(NULL, win);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean on_replace_entry_key(GtkEventControllerKey *ctrl,
+                                      guint keyval, guint keycode,
+                                      GdkModifierType state, gpointer data) {
+    (void)ctrl; (void)keycode; (void)state;
+    NotesWindow *win = data;
+    if (keyval == GDK_KEY_Escape) {
+        search_bar_close(win);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void notes_window_show_search(NotesWindow *win, gboolean with_replace) {
+    gtk_widget_set_visible(win->search_bar, TRUE);
+    gtk_widget_set_visible(win->replace_box, with_replace);
+    gtk_widget_grab_focus(win->search_entry);
+
+    /* Pre-fill with selected text */
+    GtkTextIter sel_s, sel_e;
+    if (gtk_text_buffer_get_selection_bounds(win->buffer, &sel_s, &sel_e)) {
+        if (gtk_text_iter_get_line(&sel_s) == gtk_text_iter_get_line(&sel_e)) {
+            char *sel = gtk_text_buffer_get_text(win->buffer, &sel_s, &sel_e, FALSE);
+            gtk_editable_set_text(GTK_EDITABLE(win->search_entry), sel);
+            g_free(sel);
+        }
+    }
+    /* Select all text in the entry for quick overwrite */
+    gtk_editable_select_region(GTK_EDITABLE(win->search_entry), 0, -1);
+}
+
+typedef struct { NotesWindow *win; GtkWidget *entry; GtkWidget *dialog; } GotoData;
+
+static void on_goto_activate(GtkEntry *e, gpointer data) {
+    (void)e;
+    GotoData *gd = data;
+    const char *text = gtk_editable_get_text(GTK_EDITABLE(gd->entry));
+    int line = atoi(text);
+    if (line < 1) line = 1;
+    int total = gtk_text_buffer_get_line_count(gd->win->buffer);
+    if (line > total) line = total;
+
+    GtkTextIter iter;
+    gtk_text_buffer_get_iter_at_line(gd->win->buffer, &iter, line - 1);
+    gtk_text_buffer_place_cursor(gd->win->buffer, &iter);
+    gtk_text_view_scroll_to_iter(gd->win->text_view, &iter, 0.2, FALSE, 0, 0);
+
+    gtk_window_destroy(GTK_WINDOW(gd->dialog));
+}
+
+static void on_goto_data_free(gpointer data, GClosure *c) {
+    (void)c;
+    g_free(data);
+}
+
+static gboolean on_goto_key(GtkEventControllerKey *ctrl, guint keyval,
+                             guint keycode, GdkModifierType state, gpointer data) {
+    (void)ctrl; (void)keycode; (void)state;
+    if (keyval == GDK_KEY_Escape) {
+        gtk_window_destroy(GTK_WINDOW(((GotoData *)data)->dialog));
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void notes_window_goto_line(NotesWindow *win) {
+    GtkWidget *dialog = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(dialog), "Go to Line");
+    gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(win->window));
+    gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 260, -1);
+    gtk_window_set_resizable(GTK_WINDOW(dialog), FALSE);
+    gtk_window_set_titlebar(GTK_WINDOW(dialog), adw_header_bar_new());
+
+    GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_margin_start(vbox, 16);
+    gtk_widget_set_margin_end(vbox, 16);
+    gtk_widget_set_margin_top(vbox, 16);
+    gtk_widget_set_margin_bottom(vbox, 16);
+
+    int total = gtk_text_buffer_get_line_count(win->buffer);
+    char label_text[64];
+    snprintf(label_text, sizeof(label_text), "Line number (1 - %d):", total);
+    GtkWidget *label = gtk_label_new(label_text);
+    gtk_widget_set_halign(label, GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(vbox), label);
+
+    GtkWidget *entry = gtk_entry_new();
+    gtk_entry_set_input_purpose(GTK_ENTRY(entry), GTK_INPUT_PURPOSE_DIGITS);
+    gtk_box_append(GTK_BOX(vbox), entry);
+
+    gtk_window_set_child(GTK_WINDOW(dialog), vbox);
+
+    GotoData *gd = g_new(GotoData, 1);
+    gd->win = win;
+    gd->entry = entry;
+    gd->dialog = dialog;
+
+    g_signal_connect_data(entry, "activate",
+        G_CALLBACK(on_goto_activate), gd,
+        on_goto_data_free, 0);
+
+    GtkEventController *key = gtk_event_controller_key_new();
+    g_signal_connect(key, "key-pressed", G_CALLBACK(on_goto_key), gd);
+    gtk_widget_add_controller(dialog, key);
+
+    gtk_window_present(GTK_WINDOW(dialog));
+    gtk_widget_grab_focus(entry);
+}
+
+/* ── SSH/SFTP ── */
+
+gboolean notes_window_is_remote(NotesWindow *win) {
+    return win->ssh_host[0] != '\0';
+}
+
+static void update_ssh_status(NotesWindow *win) {
+    if (notes_window_is_remote(win)) {
+        char label[512];
+        snprintf(label, sizeof(label), "SSH: %s@%s", win->ssh_user, win->ssh_host);
+        gtk_button_set_label(GTK_BUTTON(win->ssh_status_btn), label);
+    } else {
+        gtk_button_set_label(GTK_BUTTON(win->ssh_status_btn), "SSH: Off");
+    }
+}
+
+void notes_window_ssh_connect(NotesWindow *win,
+                               const char *host, const char *user,
+                               int port, const char *key,
+                               const char *remote_path) {
+    /* Disconnect previous if any */
+    if (notes_window_is_remote(win))
+        notes_window_ssh_disconnect(win);
+
+    g_strlcpy(win->ssh_host, host, sizeof(win->ssh_host));
+    g_strlcpy(win->ssh_user, user, sizeof(win->ssh_user));
+    win->ssh_port = port;
+    g_strlcpy(win->ssh_key, key, sizeof(win->ssh_key));
+    g_strlcpy(win->ssh_remote_path, remote_path, sizeof(win->ssh_remote_path));
+
+    snprintf(win->ssh_mount, sizeof(win->ssh_mount),
+             "/tmp/note-light-sftp-%d-%s@%s", (int)getpid(), user, host);
+
+    ssh_ctl_start(win->ssh_ctl_dir, sizeof(win->ssh_ctl_dir),
+                  win->ssh_ctl_path, sizeof(win->ssh_ctl_path),
+                  host, user, port, key);
+
+    update_ssh_status(win);
+}
+
+void notes_window_ssh_disconnect(NotesWindow *win) {
+    if (!notes_window_is_remote(win)) return;
+
+    ssh_ctl_stop(win->ssh_ctl_path, win->ssh_ctl_dir,
+                 win->ssh_host, win->ssh_user);
+
+    win->ssh_host[0] = '\0';
+    win->ssh_user[0] = '\0';
+    win->ssh_port = 0;
+    win->ssh_key[0] = '\0';
+    win->ssh_remote_path[0] = '\0';
+    win->ssh_mount[0] = '\0';
+
+    update_ssh_status(win);
+}
+
+/* Open remote file — called from SFTP file browser dialog */
+void notes_window_open_remote_file(NotesWindow *win, const char *remote_path) {
+    char *contents = NULL;
+    gsize len = 0;
+
+    if (!ssh_cat_file(win->ssh_host, win->ssh_user, win->ssh_port,
+                      win->ssh_key, win->ssh_ctl_path,
+                      remote_path, &contents, &len, 5 * 1024 * 1024)) {
+        return;
+    }
+
+    /* Detect binary */
+    gboolean is_binary = FALSE;
+    gsize check = len < 8192 ? len : 8192;
+    for (gsize i = 0; i < check; i++) {
+        if (contents[i] == '\0') { is_binary = TRUE; break; }
+    }
+    if (is_binary) {
+        for (gsize i = 0; i < len; i++) {
+            if (contents[i] == '\0') contents[i] = '.';
+        }
+    }
+    if (!g_utf8_validate(contents, (gssize)len, NULL)) {
+        is_binary = TRUE;
+        gsize bw = 0;
+        char *utf8 = g_convert_with_fallback(contents, (gssize)len,
+                         "UTF-8", "ISO-8859-1", ".", NULL, &bw, NULL);
+        if (utf8) { g_free(contents); contents = utf8; len = bw; }
+    }
+
+    g_signal_handlers_block_by_func(win->buffer, on_buffer_changed, win);
+    g_signal_handlers_block_by_func(win->buffer, on_cursor_moved, win);
+
+    gtk_text_buffer_set_text(win->buffer, contents, (int)len);
+
+    g_free(win->original_content);
+    win->original_content = contents;
+    win->is_binary = is_binary;
+    win->is_truncated = FALSE;
+    win->dirty = FALSE;
+
+    /* Store virtual path for save operations */
+    snprintf(win->current_file, sizeof(win->current_file), "%s%s",
+             win->ssh_mount, remote_path);
+
+    char *base = g_path_get_basename(remote_path);
+    char title[512];
+    snprintf(title, sizeof(title), "%s [%s@%s]", base, win->ssh_user, win->ssh_host);
+    gtk_window_set_title(GTK_WINDOW(win->window), title);
+    g_free(base);
+
+    GtkTextIter start;
+    gtk_text_buffer_get_start_iter(win->buffer, &start);
+    gtk_text_buffer_place_cursor(win->buffer, &start);
+
+    g_signal_handlers_unblock_by_func(win->buffer, on_buffer_changed, win);
+    g_signal_handlers_unblock_by_func(win->buffer, on_cursor_moved, win);
+
+    update_cursor_position(win);
+    if (win->settings.show_line_numbers)
+        update_line_numbers(win->buffer, win);
+    update_line_highlights(win);
+    apply_font_intensity(win);
+
+    char status[128];
+    snprintf(status, sizeof(status), "UTF-8 | %s | remote", is_binary ? "BIN" : "TEXT");
+    gtk_label_set_text(win->status_encoding, status);
+}
+
+/* Save to remote file */
+gboolean save_remote_file(NotesWindow *win) {
+    if (!notes_window_is_remote(win)) return FALSE;
+    if (!ssh_path_is_remote(win->current_file)) return FALSE;
+
+    char remote[4096];
+    ssh_to_remote_path(win->ssh_mount, win->ssh_remote_path,
+                       win->current_file, remote, sizeof(remote));
+
+    GtkTextIter s, e;
+    gtk_text_buffer_get_bounds(win->buffer, &s, &e);
+    char *text = gtk_text_buffer_get_text(win->buffer, &s, &e, FALSE);
+    gsize len = strlen(text);
+
+    gboolean ok = ssh_write_file(win->ssh_host, win->ssh_user, win->ssh_port,
+                                  win->ssh_key, win->ssh_ctl_path,
+                                  remote, text, len);
+
+    if (ok) {
+        g_free(win->original_content);
+        win->original_content = text;
+        win->dirty = FALSE;
+
+        char *base = g_path_get_basename(remote);
+        char title[512];
+        snprintf(title, sizeof(title), "%s [%s@%s]", base, win->ssh_user, win->ssh_host);
+        gtk_window_set_title(GTK_WINDOW(win->window), title);
+        g_free(base);
+    } else {
+        g_free(text);
+    }
+
+    return ok;
 }
 
 NotesWindow *notes_window_new(GtkApplication *app) {
@@ -735,6 +1246,11 @@ NotesWindow *notes_window_new(GtkApplication *app) {
     gtk_text_view_set_top_margin(win->text_view, 8);
     gtk_text_view_set_bottom_margin(win->text_view, 8);
 
+    /* Search highlight tag */
+    win->search_tag = gtk_text_buffer_create_tag(win->buffer, "search-match",
+                                                  "background", "#f0b030",
+                                                  "foreground", "#000000", NULL);
+
     /* Font intensity tag */
     win->intensity_tag = gtk_text_buffer_create_tag(win->buffer, "intensity",
                                                      "foreground-rgba", NULL, NULL);
@@ -757,10 +1273,24 @@ NotesWindow *notes_window_new(GtkApplication *app) {
     g_signal_connect_swapped(main_vadj, "value-changed",
                              G_CALLBACK(gtk_widget_queue_draw), win->line_numbers);
 
+    win->scrolled_window = scrolled;
+
+    /* Scrollbar match markers overlay — sits on right edge of scrolled window */
+    GtkWidget *scroll_overlay = gtk_overlay_new();
+    gtk_overlay_set_child(GTK_OVERLAY(scroll_overlay), scrolled);
+
+    win->scrollbar_overlay = gtk_drawing_area_new();
+    gtk_widget_set_halign(win->scrollbar_overlay, GTK_ALIGN_END);
+    gtk_widget_set_size_request(win->scrollbar_overlay, 6, -1);
+    gtk_widget_set_can_target(win->scrollbar_overlay, FALSE);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(win->scrollbar_overlay),
+                                    draw_scrollbar_markers, win, NULL);
+    gtk_overlay_add_overlay(GTK_OVERLAY(scroll_overlay), win->scrollbar_overlay);
+
     /* HBox: line numbers + text view */
     win->editor_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_box_append(GTK_BOX(win->editor_box), win->ln_scrolled);
-    gtk_box_append(GTK_BOX(win->editor_box), scrolled);
+    gtk_box_append(GTK_BOX(win->editor_box), scroll_overlay);
 
     /* Status bar */
     GtkWidget *status_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
@@ -775,13 +1305,77 @@ NotesWindow *notes_window_new(GtkApplication *app) {
     gtk_widget_set_hexpand(GTK_WIDGET(win->status_encoding), TRUE);
     gtk_box_append(GTK_BOX(status_bar), GTK_WIDGET(win->status_encoding));
 
+    win->ssh_status_btn = gtk_button_new_with_label("SSH: Off");
+    gtk_widget_add_css_class(win->ssh_status_btn, "flat");
+    gtk_widget_set_halign(win->ssh_status_btn, GTK_ALIGN_END);
+    gtk_box_append(GTK_BOX(status_bar), win->ssh_status_btn);
+
     win->status_cursor = GTK_LABEL(gtk_label_new("Ln 1, Col 1"));
     gtk_widget_set_halign(GTK_WIDGET(win->status_cursor), GTK_ALIGN_END);
     gtk_box_append(GTK_BOX(status_bar), GTK_WIDGET(win->status_cursor));
 
-    /* Main vbox: editor + statusbar */
+    /* Search bar */
+    win->search_bar = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_margin_start(win->search_bar, 8);
+    gtk_widget_set_margin_end(win->search_bar, 8);
+    gtk_widget_set_margin_top(win->search_bar, 4);
+    gtk_widget_set_margin_bottom(win->search_bar, 4);
+    gtk_widget_set_visible(win->search_bar, FALSE);
+
+    /* Search row */
+    GtkWidget *search_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    win->search_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(win->search_entry), "Find...");
+    gtk_widget_set_hexpand(win->search_entry, TRUE);
+    g_signal_connect(win->search_entry, "changed", G_CALLBACK(on_search_changed), win);
+
+    GtkEventController *search_key = gtk_event_controller_key_new();
+    g_signal_connect(search_key, "key-pressed", G_CALLBACK(on_search_entry_key), win);
+    gtk_widget_add_controller(win->search_entry, search_key);
+
+    GtkWidget *prev_btn = gtk_button_new_from_icon_name("go-up-symbolic");
+    GtkWidget *next_btn = gtk_button_new_from_icon_name("go-down-symbolic");
+    g_signal_connect(prev_btn, "clicked", G_CALLBACK(on_search_prev), win);
+    g_signal_connect(next_btn, "clicked", G_CALLBACK(on_search_next), win);
+
+    win->match_label = gtk_label_new("");
+    gtk_widget_set_size_request(win->match_label, 80, -1);
+
+    GtkWidget *close_btn = gtk_button_new_from_icon_name("window-close-symbolic");
+    g_signal_connect(close_btn, "clicked", G_CALLBACK(on_search_close), win);
+
+    gtk_box_append(GTK_BOX(search_row), win->search_entry);
+    gtk_box_append(GTK_BOX(search_row), prev_btn);
+    gtk_box_append(GTK_BOX(search_row), next_btn);
+    gtk_box_append(GTK_BOX(search_row), win->match_label);
+    gtk_box_append(GTK_BOX(search_row), close_btn);
+    gtk_box_append(GTK_BOX(win->search_bar), search_row);
+
+    /* Replace row */
+    win->replace_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    win->replace_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(win->replace_entry), "Replace...");
+    gtk_widget_set_hexpand(win->replace_entry, TRUE);
+
+    GtkEventController *replace_key = gtk_event_controller_key_new();
+    g_signal_connect(replace_key, "key-pressed", G_CALLBACK(on_replace_entry_key), win);
+    gtk_widget_add_controller(win->replace_entry, replace_key);
+
+    GtkWidget *repl_btn = gtk_button_new_with_label("Replace");
+    GtkWidget *repl_all_btn = gtk_button_new_with_label("All");
+    g_signal_connect(repl_btn, "clicked", G_CALLBACK(on_replace_one), win);
+    g_signal_connect(repl_all_btn, "clicked", G_CALLBACK(on_replace_all), win);
+
+    gtk_box_append(GTK_BOX(win->replace_box), win->replace_entry);
+    gtk_box_append(GTK_BOX(win->replace_box), repl_btn);
+    gtk_box_append(GTK_BOX(win->replace_box), repl_all_btn);
+    gtk_box_append(GTK_BOX(win->search_bar), win->replace_box);
+    gtk_widget_set_visible(win->replace_box, FALSE);
+
+    /* Main vbox: search + editor + statusbar */
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_set_vexpand(win->editor_box, TRUE);
+    gtk_box_append(GTK_BOX(vbox), win->search_bar);
     gtk_box_append(GTK_BOX(vbox), win->editor_box);
     gtk_box_append(GTK_BOX(vbox), status_bar);
 

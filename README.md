@@ -12,17 +12,23 @@ Fast, minimal text editor written in C with GTK 4 and libadwaita.
 - Font intensity (alpha blending)
 - Configurable line spacing and word wrap
 - Zoom (Ctrl+/-)
-- Status bar (encoding, file type, size, cursor position)
+- Find & Replace (Ctrl+F / Ctrl+H) with match count, scrollbar markers
+- Go to Line (Ctrl+G)
+- SSH/SFTP remote file editing (connect, browse, open, save)
+- Status bar (encoding, file type, size, cursor position, SSH status)
 - Persistent settings (~/.config/notes-light/settings.conf)
+- Saved SSH connection profiles (~/.config/notes-light/connections.conf)
 - Auto-restore last opened file
 - Auto-save on close
 - Atomic file writes (tmp + rename)
 - CSS injection protection
+- Full theme support for all dialogs
 
 ## Dependencies
 
 - GTK 4
 - libadwaita-1
+- OpenSSH client (for SFTP features)
 
 ## Build
 
@@ -39,9 +45,23 @@ make
 | Ctrl+S | Save |
 | Ctrl+Shift+S | Save As |
 | Ctrl+N | New file |
+| Ctrl+F | Find |
+| Ctrl+H | Find & Replace |
+| Ctrl+G | Go to Line |
 | Ctrl+= / Ctrl++ | Zoom in |
 | Ctrl+- | Zoom out |
 | Ctrl+Q | Quit |
+
+## SSH/SFTP
+
+Notes Light can edit files on remote servers via SSH. No external libraries required — uses the system OpenSSH client with ControlMaster for connection multiplexing.
+
+1. **SFTP Connect** — open from hamburger menu, configure host/port/user/key, save profiles
+2. **Open Remote File** — browse remote directories, click to open files
+3. **Save** — Ctrl+S writes back to the remote file via SSH
+4. **Disconnect** — closes the ControlMaster session
+
+Authentication: private key (recommended) or SSH agent. Passwords are not saved to disk.
 
 ## License
 

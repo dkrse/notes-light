@@ -3,7 +3,7 @@ CFLAGS = -std=c17 -Wall -Wextra -O2 $(shell pkg-config --cflags libadwaita-1)
 LDFLAGS = $(shell pkg-config --libs libadwaita-1)
 
 BUILDDIR = build
-SRC = src/main.c src/window.c src/settings.c src/actions.c
+SRC = src/main.c src/window.c src/settings.c src/actions.c src/ssh.c
 OBJ = $(patsubst src/%.c,$(BUILDDIR)/%.o,$(SRC))
 BIN = $(BUILDDIR)/notes-light
 

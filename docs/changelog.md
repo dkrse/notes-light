@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.1.0 (2026-04-15)
+
+### Added
+- Find (Ctrl+F) with match highlighting, match count, next/prev (Enter/Shift+Enter)
+- Find & Replace (Ctrl+H) with replace one and replace all
+- Scrollbar match markers (orange indicators on vertical scrollbar showing match positions)
+- Go to Line (Ctrl+G)
+- SSH/SFTP remote file editing via system OpenSSH client
+  - SFTP Connect dialog with saved connection profiles (host, port, user, key, remote path)
+  - Connection profiles persisted in ~/.config/notes-light/connections.conf (0600 permissions)
+  - Async connection test via GTask (non-blocking UI)
+  - SSH ControlMaster for connection multiplexing (near-zero per-command overhead)
+  - Remote file browser dialog (ls -1pA, directory navigation, click to open)
+  - Remote file open (ssh cat)
+  - Remote file save (ssh tee) — Ctrl+S works for remote files
+  - SSH status indicator in status bar
+  - Auto-disconnect on window close
+  - Remote paths not saved as last_file
+- AdwHeaderBar on all dialog windows (Settings, SFTP, Open Remote, Go to Line)
+- Full theme CSS for dialog widgets (entry, label, list, button, separator, scrolledwindow, checkbutton, scale)
+- Find, Find & Replace, Go to Line in hamburger menu
+
+### Fixed
+- Font intensity now applies to entire buffer (was only visible range + margin, causing 100% intensity on scroll)
+- Font intensity now re-applied after file load (was lost because apply_settings ran before load_file replaced buffer content)
+
 ## 1.0.0 (2026-04-14)
 
 Initial release. Stripped-down fork of notes-desktop.
@@ -9,7 +35,7 @@ Initial release. Stripped-down fork of notes-desktop.
 - 13 color themes (System, Light, Dark, Solarized Light/Dark, Monokai, Gruvbox Light/Dark, Nord, Dracula, Tokyo Night, Catppuccin Latte/Mocha)
 - Custom GtkTextView subclass with current line highlight overlay
 - Line numbers via Cairo GtkDrawingArea (visible lines only)
-- Font intensity control (alpha blending on visible range)
+- Font intensity control (alpha blending)
 - Configurable line spacing and word wrap
 - Zoom in/out (Ctrl+/-)
 - Status bar: encoding, file type (TEXT/BIN), file size, cursor position (Ln/Col)

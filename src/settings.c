@@ -92,6 +92,69 @@ void settings_load(NotesSettings *s) {
     fclose(f);
 }
 
+/* ── SFTP Connections ── */
+
+static char *connections_get_path(void) {
+    static char path[1024];
+    const char *config = g_get_user_config_dir();
+    snprintf(path, sizeof(path), "%s/notes-light/connections.conf", config);
+    return path;
+}
+
+void connections_load(SftpConnections *c) {
+    memset(c, 0, sizeof(*c));
+    FILE *f = fopen(connections_get_path(), "r");
+    if (!f) return;
+
+    char line[4096];
+    int idx = -1;
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (line[0] == '[') {
+            idx++;
+            if (idx >= MAX_CONNECTIONS) break;
+            c->count = idx + 1;
+            char *end = strchr(line, ']');
+            if (end) *end = '\0';
+            g_strlcpy(c->items[idx].name, line + 1, sizeof(c->items[idx].name));
+            c->items[idx].port = 22;
+            continue;
+        }
+        if (idx < 0 || idx >= MAX_CONNECTIONS) continue;
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        const char *key = line, *val = eq + 1;
+        SftpConnection *s = &c->items[idx];
+        if (strcmp(key, "host") == 0) g_strlcpy(s->host, val, sizeof(s->host));
+        else if (strcmp(key, "port") == 0) s->port = atoi(val);
+        else if (strcmp(key, "user") == 0) g_strlcpy(s->user, val, sizeof(s->user));
+        else if (strcmp(key, "remote_path") == 0) g_strlcpy(s->remote_path, val, sizeof(s->remote_path));
+        else if (strcmp(key, "use_key") == 0) s->use_key = atoi(val);
+        else if (strcmp(key, "key_path") == 0) g_strlcpy(s->key_path, val, sizeof(s->key_path));
+    }
+    fclose(f);
+}
+
+void connections_save(const SftpConnections *c) {
+    ensure_config_dir();
+    FILE *f = fopen(connections_get_path(), "w");
+    if (!f) return;
+    fchmod(fileno(f), 0600);
+    for (int i = 0; i < c->count; i++) {
+        const SftpConnection *s = &c->items[i];
+        fprintf(f, "[%s]\n", s->name);
+        fprintf(f, "host=%s\n", s->host);
+        fprintf(f, "port=%d\n", s->port);
+        fprintf(f, "user=%s\n", s->user);
+        fprintf(f, "remote_path=%s\n", s->remote_path);
+        fprintf(f, "use_key=%d\n", s->use_key);
+        fprintf(f, "key_path=%s\n", s->key_path);
+        fprintf(f, "\n");
+    }
+    fclose(f);
+}
+
 void settings_save(const NotesSettings *s) {
     ensure_config_dir();
     char *path = settings_get_config_path();

@@ -28,10 +28,44 @@ typedef struct {
     gboolean              is_binary;
     gboolean              is_truncated;
     char                 *original_content;
+
+    /* SSH/SFTP state */
+    char                  ssh_host[256];
+    char                  ssh_user[128];
+    int                   ssh_port;
+    char                  ssh_key[1024];
+    char                  ssh_remote_path[1024];
+    char                  ssh_mount[2048];
+    char                  ssh_ctl_path[512];
+    char                  ssh_ctl_dir[256];
+    GtkWidget            *ssh_status_btn;
+
+    /* Search/Replace */
+    GtkWidget            *search_bar;
+    GtkWidget            *search_entry;
+    GtkWidget            *replace_entry;
+    GtkWidget            *replace_box;
+    GtkWidget            *match_label;
+    GtkTextTag           *search_tag;
+    GtkWidget            *scrolled_window;
+    GtkWidget            *scrollbar_overlay;
+    int                  *match_lines;
+    int                   match_count;
+    int                   match_current;
 } NotesWindow;
 
 NotesWindow *notes_window_new(GtkApplication *app);
 void         notes_window_apply_settings(NotesWindow *win);
 void         notes_window_load_file(NotesWindow *win, const char *path);
+void         notes_window_show_search(NotesWindow *win, gboolean with_replace);
+void         notes_window_goto_line(NotesWindow *win);
+void         notes_window_ssh_connect(NotesWindow *win,
+                                       const char *host, const char *user,
+                                       int port, const char *key,
+                                       const char *remote_path);
+void         notes_window_ssh_disconnect(NotesWindow *win);
+gboolean     notes_window_is_remote(NotesWindow *win);
+gboolean     save_remote_file(NotesWindow *win);
+void         notes_window_open_remote_file(NotesWindow *win, const char *remote_path);
 
 #endif
