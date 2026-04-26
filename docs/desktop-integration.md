@@ -35,7 +35,10 @@ Icon=/home/USER/Apps/notes-light/images/notes-light.png
 Terminal=false
 Categories=Utility;TextEditor;
 StartupNotify=true
+StartupWMClass=com.notes.light
 ```
+
+`StartupWMClass` must match the application ID passed to `adw_application_new()` in `src/main.c` (`com.notes.light`). Without it, GNOME Shell cannot link the running window's `app_id` to this `.desktop` file, so the app appears in the dash as a separate, unnamed icon instead of highlighting its launcher.
 
 Make it executable and trusted (GNOME/Nautilus refuses to launch it otherwise):
 
@@ -128,5 +131,6 @@ You may also want to clean up `~/.config/mimeapps.list` — user-level default a
 | `Categories` | Where it lands in the menu (`TextEditor`, `Utility`, `Development`…). |
 | `Terminal` | `false` for GUI apps. |
 | `StartupNotify` | Shows the "loading" cursor during launch. |
+| `StartupWMClass` | Must equal the GApplication ID (`com.notes.light`) so the dash groups the window with its launcher icon. |
 
 Specification: <https://specifications.freedesktop.org/desktop-entry-spec/latest/>
