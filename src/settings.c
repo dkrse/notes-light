@@ -34,6 +34,7 @@ void settings_load(NotesSettings *s) {
     s->highlight_current_line = TRUE;
     s->wrap_lines = TRUE;
     s->highlight_syntax = TRUE;
+    s->show_whitespace = FALSE;
     s->window_width = 700;
     s->window_height = 500;
     s->last_file[0] = '\0';
@@ -82,6 +83,8 @@ void settings_load(NotesSettings *s) {
             s->wrap_lines = (strcmp(val, "1") == 0);
         else if (strcmp(key, "highlight_syntax") == 0)
             s->highlight_syntax = (strcmp(val, "1") == 0);
+        else if (strcmp(key, "show_whitespace") == 0)
+            s->show_whitespace = (strcmp(val, "1") == 0);
         else if (strcmp(key, "window_width") == 0) {
             int v = atoi(val); if (v >= 200 && v <= 8192) s->window_width = v;
         } else if (strcmp(key, "window_height") == 0) {
@@ -89,10 +92,38 @@ void settings_load(NotesSettings *s) {
         }
         else if (strcmp(key, "last_file") == 0)
             SAFE_COPY(s->last_file, val);
+        else if (strncmp(key, "recent_", 7) == 0) {
+            int idx = atoi(key + 7);
+            if (idx >= 0 && idx < MAX_RECENT_FILES && val[0]) {
+                SAFE_COPY(s->recent_files[idx], val);
+                if (idx + 1 > s->recent_count) s->recent_count = idx + 1;
+            }
+        }
 
         #undef SAFE_COPY
     }
     fclose(f);
+}
+
+void settings_push_recent(NotesSettings *s, const char *path) {
+    if (!path || !path[0]) return;
+
+    int existing = -1;
+    for (int i = 0; i < s->recent_count; i++) {
+        if (strcmp(s->recent_files[i], path) == 0) { existing = i; break; }
+    }
+    if (existing == 0) return;
+
+    int top = (existing > 0) ? existing
+                             : (s->recent_count < MAX_RECENT_FILES
+                                ? s->recent_count
+                                : MAX_RECENT_FILES - 1);
+    for (int i = top; i > 0; i--) {
+        memcpy(s->recent_files[i], s->recent_files[i - 1], sizeof(s->recent_files[i]));
+    }
+    g_strlcpy(s->recent_files[0], path, sizeof(s->recent_files[0]));
+    if (existing < 0 && s->recent_count < MAX_RECENT_FILES)
+        s->recent_count++;
 }
 
 /* ── SFTP Connections ── */
@@ -199,9 +230,14 @@ void settings_save(const NotesSettings *s) {
     fprintf(f, "highlight_current_line=%d\n", s->highlight_current_line);
     fprintf(f, "wrap_lines=%d\n", s->wrap_lines);
     fprintf(f, "highlight_syntax=%d\n", s->highlight_syntax);
+    fprintf(f, "show_whitespace=%d\n", s->show_whitespace);
     fprintf(f, "window_width=%d\n", s->window_width);
     fprintf(f, "window_height=%d\n", s->window_height);
     fprintf(f, "last_file=%s\n", s->last_file);
+    for (int i = 0; i < s->recent_count; i++) {
+        if (s->recent_files[i][0])
+            fprintf(f, "recent_%d=%s\n", i, s->recent_files[i]);
+    }
 
     gboolean ok = (fflush(f) == 0);
     fclose(f);

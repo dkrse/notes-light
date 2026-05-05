@@ -57,6 +57,12 @@ typedef struct {
     int                  *match_offsets;  /* byte offsets of each match start */
     int                   match_count;
     int                   match_current;
+
+    /* Auto-reload */
+    GFileMonitor         *file_monitor;
+
+    /* Recent files menu (rebuilt dynamically) */
+    GMenu                *recent_menu;
 } NotesWindow;
 
 guint32      fnv1a_hash(const char *data, gsize len);
@@ -73,5 +79,7 @@ void         notes_window_ssh_disconnect(NotesWindow *win);
 gboolean     notes_window_is_remote(NotesWindow *win);
 gboolean     save_remote_file(NotesWindow *win);
 void         notes_window_open_remote_file(NotesWindow *win, const char *remote_path);
+void         notes_window_recent_menu_rebuild(NotesWindow *win);
+void         notes_window_print(NotesWindow *win);
 
 #endif

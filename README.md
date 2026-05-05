@@ -11,9 +11,14 @@ Fast, minimal text editor written in C with GTK 4 and libadwaita.
 - Theme-aware syntax color schemes (each theme maps to a matching GtkSourceView style scheme)
 - Line numbers with Cairo rendering
 - Current line highlight (overlay)
+- Show/hide whitespace (spaces, tabs, newlines) toggle in menu
 - Font intensity (alpha blending)
 - Configurable line spacing and word wrap
-- Zoom (Ctrl+/-)
+- Zoom (Ctrl+/-, Ctrl+mouse wheel)
+- Undo / Redo (Ctrl+Z / Ctrl+Shift+Z) in menu
+- Print (Ctrl+P) with paginated Pango layout
+- Recent files submenu (last 10, persisted in settings.conf)
+- Auto-reload when the open file changes on disk (cursor preserved; prompt if buffer is dirty)
 - Find & Replace (Ctrl+F / Ctrl+H) with match count, scrollbar markers
 - Go to Line (Ctrl+G)
 - SSH/SFTP remote file editing (connect, browse, open, save) with disabled menu items when disconnected
@@ -38,6 +43,8 @@ Fast, minimal text editor written in C with GTK 4 and libadwaita.
 ## Build
 
 ```
+sudo apt install libadwaita-1-dev libgtksourceview-5-dev gcc make pkg-config
+
 make
 ./build/notes-light
 ```
@@ -50,11 +57,15 @@ make
 | Ctrl+S | Save |
 | Ctrl+Shift+S | Save As |
 | Ctrl+N | New file |
+| Ctrl+P | Print |
+| Ctrl+Z | Undo |
+| Ctrl+Shift+Z / Ctrl+Y | Redo |
 | Ctrl+F | Find |
 | Ctrl+H | Find & Replace |
 | Ctrl+G | Go to Line |
 | Ctrl+= / Ctrl++ | Zoom in |
 | Ctrl+- | Zoom out |
+| Ctrl+mouse wheel | Zoom in/out (1pt step) |
 | Ctrl+Q | Quit |
 
 ## SSH/SFTP

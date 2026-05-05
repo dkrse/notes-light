@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.3.0 (2026-05-05)
+
+### Added
+- Show / hide whitespace toggle in hamburger menu (`win.toggle-whitespace`,
+  stateful action) — renders spaces, tabs, newlines and NBSP via
+  `GtkSourceSpaceDrawer`; persisted in settings.conf as `show_whitespace`
+- Auto-reload when the open file changes on disk
+  - `GFileMonitor` per window, installed in `notes_window_load_file`
+  - Skips events caused by our own atomic save (FNV-1a hash compare against
+    `original_hash`)
+  - Clean buffer → silent reload preserving cursor line/column
+  - Dirty buffer → modal dialog (Reload (discard) / Keep my version)
+  - Skipped for SSH/remote files
+- Undo / Redo
+  - Menu items in Edit section
+  - Accelerators Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y
+  - Backed by built-in `gtk_text_buffer_undo` / `_redo`
+- Print support
+  - `Ctrl+P`, *Print...* in menu
+  - `GtkPrintOperation` with `PangoLayout` pagination
+  - Uses the configured monospace font; word-char wrap to page width
+- Recent files
+  - *Open Recent* submenu (last 10), dynamically rebuilt after each load
+  - Persisted as `recent_N=...` in settings.conf
+  - Dedup + push-front on each successful open
+  - `win.open-recent` action takes a path string parameter
+- Ctrl + mouse wheel zoom on the text view (1pt step, clamped 6..72)
+- Hamburger menu re-organized into File / Edit / View / SSH / Settings
+  sections (visual separators between groups)
+
+### Changed (refactor)
+- Split monolithic `window.c` (~1600 lines) into focused modules:
+  - `theme.c/h` — custom themes, CSS, source style/language, dark detection
+  - `editor_view.c/h` — `NotesTextView` subclass, line numbers, font
+    intensity, dirty detection, buffer signal wiring, whitespace drawer,
+    Ctrl+scroll zoom
+  - `search.c/h` — find / replace bar, scrollbar markers, Go to Line dialog
+  - `ssh_window.c/h` — connect / disconnect, open / save remote, status
+    button, SSH action gating
+  - `window.c` retains: `notes_window_new`, `load_file`, close/destroy,
+    auto-save, file monitor handler, print, recent menu rebuild
+- Split `actions.c` (~1190 lines) into:
+  - `actions_file.c` — new / open / save / save-as / open-recent / print
+  - `actions_view.c` — find / find-replace / goto-line / zoom / settings
+    dialog / undo / redo
+  - `actions_ssh.c` — SFTP dialog + remote file browser
+  - `actions.c` — only `actions_setup` (action map + accelerators) +
+    `toggle-whitespace`
+  - Cross-file handler declarations live in `actions_internal.h`
+
 ## 1.2.1 (2026-04-15)
 
 ### Performance

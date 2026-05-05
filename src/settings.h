@@ -15,13 +15,19 @@ typedef struct {
     gboolean highlight_current_line;
     gboolean wrap_lines;
     gboolean highlight_syntax;
+    gboolean show_whitespace;
     int window_width;
     int window_height;
     char last_file[2048];
+
+#define MAX_RECENT_FILES 10
+    char recent_files[MAX_RECENT_FILES][2048];
+    int recent_count;
 } NotesSettings;
 
 void     settings_load(NotesSettings *s);
 void     settings_save(const NotesSettings *s);
+void     settings_push_recent(NotesSettings *s, const char *path);
 char    *settings_get_config_path(void);
 
 /* SFTP/SSH connections */
