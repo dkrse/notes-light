@@ -29,14 +29,20 @@ gboolean ssh_spawn_sync(GPtrArray *argv, char **out_stdout, gsize *out_len);
 
 /* Read remote file via SSH cat (binary-safe).
    Caller must g_free(*out_contents). */
+/* `out_too_large` (may be NULL) is set when the file exceeded max_file_size;
+   in that case the returned contents are a placeholder, not the file. */
 gboolean ssh_cat_file(const char *host, const char *user, int port,
                       const char *key, const char *ctl_path,
                       const char *remote_path,
                       char **out_contents, gsize *out_len,
-                      gsize max_file_size);
+                      gsize max_file_size,
+                      gboolean *out_too_large);
 
 /* Write content to remote file via SSH.
    Returns TRUE on success. */
+/* Remote shell command performing an atomic, quoted write (exposed for tests). */
+char *ssh_remote_write_command(const char *remote_path);
+
 gboolean ssh_write_file(const char *host, const char *user, int port,
                         const char *key, const char *ctl_path,
                         const char *remote_path,

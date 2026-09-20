@@ -23,11 +23,10 @@ typedef struct {
     GtkEntry        *port_entry;
     GtkEntry        *user_entry;
     GtkEntry        *path_entry;
-    GtkEntry        *password_entry;
     GtkCheckButton  *use_key_check;
     GtkEntry        *key_entry;
     GtkWidget       *key_browse_btn;
-    GtkWidget       *password_row;
+    GtkWidget       *agent_note;   /* shown when no key is used */
     GtkWidget       *key_row;
     GtkWidget       *key_btn_row;
     int              selected_idx;
@@ -62,8 +61,7 @@ static void sftp_populate_list(SftpCtx *ctx) {
 
 static void sftp_update_auth_visibility(SftpCtx *ctx) {
     gboolean use_key = gtk_check_button_get_active(ctx->use_key_check);
-    gtk_widget_set_visible(ctx->password_row, !use_key);
-    gtk_widget_set_visible(GTK_WIDGET(ctx->password_entry), !use_key);
+    gtk_widget_set_visible(ctx->agent_note, !use_key);
     gtk_widget_set_visible(ctx->key_row, use_key);
     gtk_widget_set_visible(GTK_WIDGET(ctx->key_entry), use_key);
     gtk_widget_set_visible(ctx->key_btn_row, use_key);
@@ -76,16 +74,17 @@ static void on_use_key_toggled(GtkCheckButton *btn, gpointer data) {
 
 static void on_key_file_selected(GObject *src, GAsyncResult *res, gpointer data) {
     SftpCtx *ctx = data;
-    GtkFileDialog *dialog = GTK_FILE_DIALOG(src);
-    GFile *file = gtk_file_dialog_open_finish(dialog, res, NULL);
+    GFile *file = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(src), res, NULL);
     if (file) {
         char *path = g_file_get_path(file);
-        if (path) {
+        /* The SFTP dialog may have been closed while the chooser was open. */
+        if (path && ctx->dialog_alive) {
             gtk_editable_set_text(GTK_EDITABLE(ctx->key_entry), path);
-            g_free(path);
         }
+        g_free(path);
         g_object_unref(file);
     }
+    sftp_ctx_unref(ctx);
 }
 
 static void on_key_browse(GtkButton *btn, gpointer data) {
@@ -98,7 +97,9 @@ static void on_key_browse(GtkButton *btn, gpointer data) {
     GFile *init = g_file_new_for_path(ssh_dir);
     gtk_file_dialog_set_initial_folder(dialog, init);
     g_object_unref(init);
-    gtk_file_dialog_open(dialog, ctx->dialog, NULL, on_key_file_selected, ctx);
+    gtk_file_dialog_open(dialog, ctx->dialog, NULL, on_key_file_selected,
+                         sftp_ctx_ref(ctx));
+    g_object_unref(dialog);   /* the async call holds its own reference */
 }
 
 static void on_conn_selected(GtkListBox *box, GtkListBoxRow *row, gpointer data) {
@@ -118,7 +119,6 @@ static void on_conn_selected(GtkListBox *box, GtkListBoxRow *row, gpointer data)
     gtk_editable_set_text(GTK_EDITABLE(ctx->path_entry), c->remote_path);
     gtk_check_button_set_active(ctx->use_key_check, c->use_key);
     gtk_editable_set_text(GTK_EDITABLE(ctx->key_entry), c->key_path);
-    gtk_editable_set_text(GTK_EDITABLE(ctx->password_entry), "");
     sftp_update_auth_visibility(ctx);
 }
 
@@ -172,7 +172,6 @@ static void sftp_clear_form(SftpCtx *ctx) {
     gtk_editable_set_text(GTK_EDITABLE(ctx->port_entry), "22");
     gtk_editable_set_text(GTK_EDITABLE(ctx->user_entry), "");
     gtk_editable_set_text(GTK_EDITABLE(ctx->path_entry), "/");
-    gtk_editable_set_text(GTK_EDITABLE(ctx->password_entry), "");
     gtk_editable_set_text(GTK_EDITABLE(ctx->key_entry), "");
     gtk_check_button_set_active(ctx->use_key_check, FALSE);
     sftp_update_auth_visibility(ctx);
@@ -404,13 +403,16 @@ void on_sftp_dialog(GSimpleAction *action, GVariant *param, gpointer data) {
     g_signal_connect(ctx->use_key_check, "toggled", G_CALLBACK(on_use_key_toggled), ctx);
     gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->use_key_check), 1, row++, 2, 1);
 
-    GtkWidget *pass_lbl = make_label("Password:");
-    gtk_grid_attach(GTK_GRID(grid), pass_lbl, 0, row, 1, 1);
-    ctx->password_entry = GTK_ENTRY(gtk_entry_new());
-    gtk_entry_set_visibility(ctx->password_entry, FALSE);
-    gtk_widget_set_hexpand(GTK_WIDGET(ctx->password_entry), TRUE);
-    gtk_grid_attach(GTK_GRID(grid), GTK_WIDGET(ctx->password_entry), 1, row++, 2, 1);
-    ctx->password_row = pass_lbl;
+    /* No password field: every ssh call runs with BatchMode=yes, which
+       disables interactive password authentication outright. A field that
+       can never be used is worse than none — say what actually happens. */
+    ctx->agent_note = gtk_label_new(
+        "Without a key file the connection uses your running ssh-agent.\n"
+        "Password login is not available (ssh runs in batch mode).");
+    gtk_label_set_xalign(GTK_LABEL(ctx->agent_note), 0.0);
+    gtk_label_set_wrap(GTK_LABEL(ctx->agent_note), TRUE);
+    gtk_widget_add_css_class(ctx->agent_note, "dim-label");
+    gtk_grid_attach(GTK_GRID(grid), ctx->agent_note, 1, row++, 2, 1);
 
     GtkWidget *key_lbl = make_label("Key File:");
     gtk_grid_attach(GTK_GRID(grid), key_lbl, 0, row, 1, 1);
@@ -466,7 +468,21 @@ typedef struct {
     GtkLabel    *path_label;
     GtkListBox  *file_list;
     char         current_dir[4096];
+    int          ref_count;
+    gboolean     dialog_alive;
 } OpenRemoteCtx;
+
+/* The directory listing runs in a thread; the dialog can be closed while it
+   is still in flight, so the context outlives the widgets by reference. */
+static OpenRemoteCtx *remote_ctx_ref(OpenRemoteCtx *ctx) {
+    ctx->ref_count++;
+    return ctx;
+}
+
+static void remote_ctx_unref(OpenRemoteCtx *ctx) {
+    if (--ctx->ref_count <= 0)
+        g_free(ctx);
+}
 
 static void remote_browse_populate(OpenRemoteCtx *ctx);
 
@@ -504,14 +520,15 @@ static void on_remote_row_activated(GtkListBox *box, GtkListBoxRow *row, gpointe
         return;
     }
 
-    char full_path[4096];
+    /* Built on the heap: a fixed buffer would silently truncate a long path
+       and then open — or later overwrite — a different file. */
     size_t dlen = strlen(ctx->current_dir);
-    if (dlen > 0 && ctx->current_dir[dlen - 1] == '/')
-        snprintf(full_path, sizeof(full_path), "%s%s", ctx->current_dir, name);
-    else
-        snprintf(full_path, sizeof(full_path), "%s/%s", ctx->current_dir, name);
+    char *full_path = (dlen > 0 && ctx->current_dir[dlen - 1] == '/')
+        ? g_strdup_printf("%s%s", ctx->current_dir, name)
+        : g_strdup_printf("%s/%s", ctx->current_dir, name);
 
     notes_window_open_remote_file(ctx->win, full_path);
+    g_free(full_path);
     gtk_window_destroy(GTK_WINDOW(ctx->dialog));
 }
 
@@ -541,6 +558,11 @@ static void browse_done(GObject *src, GAsyncResult *res, gpointer data) {
     OpenRemoteCtx *ctx = data;
     BrowseTaskData *d = g_task_get_task_data(G_TASK(res));
 
+    if (!ctx->dialog_alive) {     /* dialog closed while ls was running */
+        remote_ctx_unref(ctx);
+        return;
+    }
+
     GtkWidget *child;
     while ((child = gtk_widget_get_first_child(GTK_WIDGET(ctx->file_list))))
         gtk_list_box_remove(ctx->file_list, child);
@@ -557,6 +579,7 @@ static void browse_done(GObject *src, GAsyncResult *res, gpointer data) {
     if (!d->ok || !d->stdout_buf) {
         GtkWidget *lbl = gtk_label_new("(failed to list directory)");
         gtk_list_box_append(ctx->file_list, lbl);
+        remote_ctx_unref(ctx);
         return;
     }
 
@@ -596,13 +619,14 @@ static void browse_done(GObject *src, GAsyncResult *res, gpointer data) {
 
     g_ptr_array_unref(dirs);
     g_ptr_array_unref(files);
+    remote_ctx_unref(ctx);
 }
 
 static void remote_browse_populate(OpenRemoteCtx *ctx) {
-    char label_text[512];
-    snprintf(label_text, sizeof(label_text), "%s@%s:%s",
+    char *label_text = g_strdup_printf("%s@%s:%s",
              ctx->win->ssh_user, ctx->win->ssh_host, ctx->current_dir);
     gtk_label_set_text(ctx->path_label, label_text);
+    g_free(label_text);
 
     GtkWidget *child;
     while ((child = gtk_widget_get_first_child(GTK_WIDGET(ctx->file_list))))
@@ -615,14 +639,16 @@ static void remote_browse_populate(OpenRemoteCtx *ctx) {
                                   ctx->win->ssh_port, ctx->win->ssh_key,
                                   ctx->win->ssh_ctl_path);
     g_ptr_array_add(av, g_strdup("--"));
-    g_ptr_array_add(av, g_strdup("ls"));
-    g_ptr_array_add(av, g_strdup("-1pA"));
-    g_ptr_array_add(av, g_strdup(ctx->current_dir));
+    /* Quoted for the remote login shell — a directory named `a; rm -rf ~`
+       would otherwise run as a command on the server. */
+    char *q_dir = g_shell_quote(ctx->current_dir);
+    g_ptr_array_add(av, g_strdup_printf("ls -1pA -- %s", q_dir));
+    g_free(q_dir);
 
     BrowseTaskData *d = g_new0(BrowseTaskData, 1);
     d->argv = av;
 
-    GTask *task = g_task_new(NULL, NULL, browse_done, ctx);
+    GTask *task = g_task_new(NULL, NULL, browse_done, remote_ctx_ref(ctx));
     g_task_set_task_data(task, d, browse_task_data_free);
     g_task_run_in_thread(task, browse_thread);
     g_object_unref(task);
@@ -630,7 +656,9 @@ static void remote_browse_populate(OpenRemoteCtx *ctx) {
 
 static void on_open_remote_destroy(GtkWidget *w, gpointer data) {
     (void)w;
-    g_free(data);
+    OpenRemoteCtx *ctx = data;
+    ctx->dialog_alive = FALSE;
+    remote_ctx_unref(ctx);
 }
 
 static gboolean on_open_remote_key(GtkEventControllerKey *ctrl, guint keyval,
@@ -650,6 +678,8 @@ void on_open_remote(GSimpleAction *action, GVariant *param, gpointer data) {
 
     OpenRemoteCtx *ctx = g_new0(OpenRemoteCtx, 1);
     ctx->win = win;
+    ctx->ref_count = 1;          /* held by the dialog */
+    ctx->dialog_alive = TRUE;
     g_strlcpy(ctx->current_dir, win->ssh_remote_path, sizeof(ctx->current_dir));
 
     GtkWidget *dialog = gtk_window_new();

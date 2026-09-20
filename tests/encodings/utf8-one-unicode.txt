@@ -1,0 +1,20 @@
+SINGLE UNICODE CHARACTER TEST
+=============================
+
+This document is UTF-8 and every character in it is plain ASCII, with
+exactly one exception hidden in the sentence below.
+
+The contract says the invoice is due on Friday, so don’t be late.
+
+That apostrophe is U+2019 RIGHT SINGLE QUOTATION MARK, not the ASCII
+apostrophe U+0027. It sits on line 7, column 55, and it is the only
+non-ASCII character in the whole file: three bytes (e2 80 99) in a
+document that is otherwise one byte per character.
+
+Expected:
+  status bar            UTF-8 | TEXT | LF | <size>
+  Encoding Info         ASCII: all but one, Typographic lookalike: 1
+  Highlight Non-ASCII   exactly one orange mark, on that apostrophe
+  Ctrl+Shift+E          jumps straight to it, every time
+  Replace Lookalikes    turns it into a plain ' and the file becomes
+                        pure ASCII

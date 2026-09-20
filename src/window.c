@@ -7,6 +7,7 @@
 #include "editor_view.h"
 #include "search.h"
 #include "theme.h"
+#include "encoding_view.h"
 #include <glib/gstdio.h>
 #include <stdio.h>
 #include <string.h>
@@ -64,7 +65,31 @@ static const char *human_size(gsize bytes) {
     return buf;
 }
 
+void notes_set_original_take(NotesWindow *win, char *text, gsize len,
+                              guint32 hash, glong chars) {
+    g_free(win->original_content);
+    win->original_content = text;
+    win->original_hash    = text ? hash : 0;
+    win->original_chars   = text ? chars : -1;
+    (void)len;
+}
+
+void notes_set_original(NotesWindow *win, char *text) {
+    if (!text) {
+        notes_set_original_take(win, NULL, 0, 0, 0);
+        return;
+    }
+    gsize len = strlen(text);
+    notes_set_original_take(win, text, len, fnv1a_hash(text, len),
+                            g_utf8_strlen(text, (gssize)len));
+}
+
 void notes_window_load_file(NotesWindow *win, const char *path) {
+    notes_window_load_file_as(win, path, NULL);
+}
+
+void notes_window_load_file_as(NotesWindow *win, const char *path,
+                                const char *charset) {
     if (!path || path[0] == '\0') return;
 
     struct stat st;
@@ -85,38 +110,55 @@ void notes_window_load_file(NotesWindow *win, const char *path) {
     fclose(fp);
     contents[len] = '\0';
 
+    win->disk_hash = fnv1a_hash(contents, len);
+
+    NotesEncodingInfo enc;
+    if (charset && charset[0])
+        encoding_force(contents, len, charset, &enc);
+    else
+        encoding_detect(contents, len, &enc);
+
+    char *raw = contents;
+    /* Whether the text is known to be valid UTF-8 without checking again:
+       the detector already validated the UTF-8/ASCII case over the whole
+       buffer, and every conversion path produces valid UTF-8 by
+       construction. */
+    gboolean known_valid = enc.is_utf8 && !enc.has_bom;
+    if (!enc.is_utf8 || enc.has_bom) {
+        gsize conv_len = 0;
+        char *utf8 = encoding_to_utf8(contents, len, &enc, &conv_len);
+        if (utf8) { contents = utf8; len = conv_len; known_valid = TRUE; }
+    }
+
+    /* Binary = embedded NULs in the decoded text (UTF-16 NUL padding is
+       gone by now), or text that still is not valid UTF-8. */
     gboolean is_binary = FALSE;
     gsize check_len = len < 8192 ? len : 8192;
     for (gsize i = 0; i < check_len; i++) {
         if (contents[i] == '\0') { is_binary = TRUE; break; }
     }
-
     if (is_binary) {
         for (gsize i = 0; i < len; i++) {
             if (contents[i] == '\0') contents[i] = '.';
         }
     }
-
-    if (!g_utf8_validate(contents, (gssize)len, NULL)) {
+    if (!known_valid && !g_utf8_validate(contents, (gssize)len, NULL)) {
         is_binary = TRUE;
-        gsize bytes_written = 0;
+        gsize bw = 0;
         char *utf8 = g_convert_with_fallback(contents, (gssize)len,
-                         "UTF-8", "ISO-8859-1", ".", NULL, &bytes_written, NULL);
+                         "UTF-8", "ISO-8859-1", ".", NULL, &bw, NULL);
         if (utf8) {
-            g_free(contents);
+            if (contents != raw) g_free(contents);
             contents = utf8;
-            len = bytes_written;
+            len = bw;
         }
     }
 
-    g_free(win->original_content);
-    if (is_binary || truncated) {
-        win->original_content = NULL;
-        win->original_hash = 0;
-    } else {
-        win->original_hash = fnv1a_hash(contents, len);
-        win->original_content = g_strndup(contents, len);
-    }
+    /* The decoded text is already a private buffer; hand it over instead of
+       copying 5 MB again. When nothing had to be transcoded it is the very
+       buffer we read, so its hash is the disk hash we just computed. */
+    guint32 text_hash = (contents == raw) ? win->disk_hash
+                                          : fnv1a_hash(contents, len);
 
     win->is_binary = is_binary;
     win->is_truncated = truncated;
@@ -140,16 +182,42 @@ void notes_window_load_file(NotesWindow *win, const char *path) {
 
     editor_view_block_signals(win);
 
+    /* Loading is not an edit: without this the buffer records the whole file
+       as one undoable insertion, which costs time and memory and lets Ctrl+Z
+       "undo" the open. The syntax engine is switched off for the insertion
+       itself — switched back on afterwards it highlights the visible region
+       lazily instead of the whole file up front. */
+    gboolean had_highlight = gtk_source_buffer_get_highlight_syntax(win->source_buffer);
+    if (had_highlight)
+        gtk_source_buffer_set_highlight_syntax(win->source_buffer, FALSE);
+
+    gtk_text_buffer_begin_irreversible_action(win->buffer);
     gtk_text_buffer_set_text(win->buffer, contents, (int)len);
-    g_free(contents);
+    gtk_text_buffer_end_irreversible_action(win->buffer);
+
+    if (had_highlight)
+        gtk_source_buffer_set_highlight_syntax(win->source_buffer, TRUE);
+
+    if (is_binary || truncated) {
+        notes_set_original_take(win, NULL, 0, 0, 0);
+    } else {
+        notes_set_original_take(win, contents, len, text_hash,
+                                gtk_text_buffer_get_char_count(win->buffer));
+        if (contents == raw) raw = NULL;   /* ownership moved */
+        contents = NULL;                   /* ditto */
+    }
 
     GtkTextIter start;
     gtk_text_buffer_get_start_iter(win->buffer, &start);
     gtk_text_buffer_place_cursor(win->buffer, &start);
 
     win->dirty = FALSE;
-    snprintf(win->current_file, sizeof(win->current_file), "%s", path);
-    snprintf(win->settings.last_file, sizeof(win->settings.last_file), "%s", path);
+    /* `path` may be win->current_file itself (reload) — snprintf into its
+       own source is undefined and used to blank the path. */
+    if (path != win->current_file)
+        snprintf(win->current_file, sizeof(win->current_file), "%s", path);
+    snprintf(win->settings.last_file, sizeof(win->settings.last_file), "%s",
+             win->current_file);
 
     char *base = g_path_get_basename(path);
     gtk_window_set_title(GTK_WINDOW(win->window), base);
@@ -157,20 +225,25 @@ void notes_window_load_file(NotesWindow *win, const char *path) {
 
     editor_view_unblock_signals(win);
 
-    char status[128];
+    char extra[64];
     if (truncated)
-        snprintf(status, sizeof(status), "UTF-8 | %s | showing first 5 MB of %s",
-                 is_binary ? "BIN" : "TEXT", human_size(file_size));
+        snprintf(extra, sizeof(extra), "showing first 5 MB of %s", human_size(file_size));
     else
-        snprintf(status, sizeof(status), "UTF-8 | %s | %s",
-                 is_binary ? "BIN" : "TEXT", human_size(file_size));
-    gtk_label_set_text(win->status_encoding, status);
+        snprintf(extra, sizeof(extra), "%s", human_size(file_size));
+    notes_encoding_set_detected(win, &enc,
+                                win->original_content ? win->original_content
+                                                      : (contents ? contents : ""),
+                                win->original_content ? len : (contents ? len : 0),
+                                extra);
+    if (contents && contents != raw) g_free(contents);
+    g_free(raw);
 
     editor_view_update_cursor_position(win);
     if (win->settings.show_line_numbers)
         editor_view_update_line_numbers(win);
     editor_view_update_line_highlights(win);
     editor_view_apply_font_intensity(win);
+
 
     settings_push_recent(&win->settings, path);
     notes_window_recent_menu_rebuild(win);
@@ -225,13 +298,20 @@ static void on_file_monitor_changed(GFileMonitor *mon, GFile *file, GFile *other
     if (notes_window_is_remote(win)) return;
     if (ssh_path_is_remote(win->current_file)) return;
 
-    /* Skip events caused by our own writes — compare hash with original_hash */
-    char *contents = NULL;
-    gsize len = 0;
-    if (!g_file_get_contents(win->current_file, &contents, &len, NULL)) return;
+    /* Skip events caused by our own writes. Hash the raw bytes and compare
+       with what we last read from (or wrote to) disk — comparing against
+       original_hash was wrong for any file that needed decoding, because
+       that hash covers the decoded text. Only the first MAX_DISPLAY_BYTES
+       are read: the rest is not displayed anyway, and re-reading a huge
+       file on every change event is what made this expensive. */
+    char *contents = g_malloc(MAX_DISPLAY_BYTES);
+    FILE *fp = fopen(win->current_file, "rb");
+    if (!fp) { g_free(contents); return; }
+    gsize len = fread(contents, 1, MAX_DISPLAY_BYTES, fp);
+    fclose(fp);
     guint32 h = fnv1a_hash(contents, len);
     g_free(contents);
-    if (h == win->original_hash) return;
+    if (h == win->disk_hash) return;
 
     if (win->dirty) {
         GtkAlertDialog *dlg = gtk_alert_dialog_new("File changed on disk");
@@ -349,43 +429,108 @@ void notes_window_print(NotesWindow *win) {
     g_object_unref(op);
 }
 
-static void auto_save_current(NotesWindow *win) {
-    if (!win->dirty) return;
-    if (win->is_binary || !win->original_content) return;
+/* Returns FALSE when the document could not be written, so the caller can
+   keep the window open instead of throwing the changes away. */
+static gboolean auto_save_current(NotesWindow *win) {
+    if (!win->dirty) return TRUE;
+    if (win->is_binary || !win->original_content) return TRUE;
+
+    /* A remote document lives under a virtual mount path that does not
+       exist on this machine — writing it locally would silently drop the
+       user's changes, so it has to go back over SSH. */
+    if (notes_window_is_remote(win) && ssh_path_is_remote(win->current_file))
+        return save_remote_file(win);
 
     GtkTextIter start, end;
     gtk_text_buffer_get_bounds(win->buffer, &start, &end);
     char *text = gtk_text_buffer_get_text(win->buffer, &start, &end, FALSE);
     if (!text || text[0] == '\0') {
         g_free(text);
+        return TRUE;
+    }
+
+    if (win->current_file[0] == '\0') {
+        g_free(text);
+        return FALSE;               /* never saved: Save As is required */
+    }
+
+    if (!notes_save_text_utf8(win, win->current_file, text)) {
+        g_free(text);
+        return FALSE;
+    }
+
+    snprintf(win->settings.last_file, sizeof(win->settings.last_file), "%s",
+             win->current_file);
+    notes_set_original(win, text);
+    win->dirty = FALSE;
+    return TRUE;
+}
+
+/* ── Replacing the document (one document per window) ── */
+
+typedef struct {
+    NotesWindow *win;
+    char        *path;
+} PendingOpen;
+
+static void pending_open_free(PendingOpen *po) {
+    g_free(po->path);
+    g_free(po);
+}
+
+static void on_open_confirm(GObject *src, GAsyncResult *res, gpointer data) {
+    PendingOpen *po = data;
+    int btn = gtk_alert_dialog_choose_finish(GTK_ALERT_DIALOG(src), res, NULL);
+
+    if (btn == 0) {                       /* Save and Open */
+        if (!auto_save_current(po->win)) {
+            GtkAlertDialog *err = gtk_alert_dialog_new("Could not save");
+            gtk_alert_dialog_set_detail(err,
+                "The current document was not written, so it is kept open "
+                "and the other file was not loaded.");
+            gtk_alert_dialog_set_modal(err, TRUE);
+            gtk_alert_dialog_show(err, GTK_WINDOW(po->win->window));
+            g_object_unref(err);
+            pending_open_free(po);
+            return;
+        }
+        notes_window_load_file(po->win, po->path);
+    } else if (btn == 1) {                /* Discard and Open */
+        po->win->dirty = FALSE;
+        notes_window_load_file(po->win, po->path);
+    }
+    pending_open_free(po);
+}
+
+void notes_window_request_open(NotesWindow *win, const char *path) {
+    if (!path || path[0] == '\0') return;
+
+    if (!win->dirty) {
+        notes_window_load_file(win, path);
         return;
     }
 
-    if (win->current_file[0] != '\0') {
-        char tmp[2112];
-        snprintf(tmp, sizeof(tmp), "%s.XXXXXX", win->current_file);
-        int fd = g_mkstemp(tmp);
-        if (fd >= 0) {
-            FILE *f = fdopen(fd, "w");
-            if (f) {
-                gboolean ok = (fputs(text, f) != EOF);
-                ok = ok && (fflush(f) == 0);
-                fclose(f);
-                if (ok)
-                    g_rename(tmp, win->current_file);
-                else
-                    g_remove(tmp);
-            } else {
-                close(fd);
-                g_remove(tmp);
-            }
-        }
-        snprintf(win->settings.last_file, sizeof(win->settings.last_file), "%s", win->current_file);
-    }
-    g_free(win->original_content);
-    win->original_content = text;
-    win->original_hash = fnv1a_hash(text, strlen(text));
-    win->dirty = FALSE;
+    PendingOpen *po = g_new0(PendingOpen, 1);
+    po->win = win;
+    po->path = g_strdup(path);
+
+    char *base = g_path_get_basename(path);
+    char msg[512];
+    snprintf(msg, sizeof(msg), "Open %s?", base);
+    g_free(base);
+
+    GtkAlertDialog *dlg = gtk_alert_dialog_new("%s", msg);
+    gtk_alert_dialog_set_detail(dlg,
+        "This window holds one document at a time, and the current one has "
+        "unsaved changes.");
+    const char *buttons[] = {"Save and Open", "Discard and Open", "Cancel", NULL};
+    gtk_alert_dialog_set_buttons(dlg, buttons);
+    gtk_alert_dialog_set_default_button(dlg, 0);
+    gtk_alert_dialog_set_cancel_button(dlg, 2);
+    gtk_alert_dialog_set_modal(dlg, TRUE);
+    gtk_alert_dialog_choose(dlg, GTK_WINDOW(win->window), NULL,
+                            on_open_confirm, po);
+    g_object_unref(dlg);
 }
 
 static void close_and_cleanup(NotesWindow *win) {
@@ -408,7 +553,19 @@ static void on_close_save_response(GObject *src, GAsyncResult *res, gpointer dat
     int btn = gtk_alert_dialog_choose_finish(dlg, res, NULL);
 
     if (btn == 0) {
-        auto_save_current(win);
+        if (!auto_save_current(win)) {
+            /* Keep the window open rather than discarding what could not
+               be written (remote host gone, permissions, no file yet). */
+            GtkAlertDialog *err = gtk_alert_dialog_new("Could not save");
+            gtk_alert_dialog_set_detail(err,
+                "The document was not written, so the window stays open and "
+                "your changes are still here. Use Save As to store it "
+                "somewhere else.");
+            gtk_alert_dialog_set_modal(err, TRUE);
+            gtk_alert_dialog_show(err, GTK_WINDOW(win->window));
+            g_object_unref(err);
+            return;
+        }
         close_and_cleanup(win);
     } else if (btn == 1) {
         win->dirty = FALSE;
@@ -457,10 +614,16 @@ static void on_destroy(GtkWidget *widget, gpointer data) {
         g_source_remove(win->title_idle_id);
         win->title_idle_id = 0;
     }
+    if (win->enc_marks_idle_id) {
+        g_source_remove(win->enc_marks_idle_id);
+        win->enc_marks_idle_id = 0;
+    }
     gtk_style_context_remove_provider_for_display(
         gdk_display_get_default(),
         GTK_STYLE_PROVIDER(win->css_provider));
     g_object_unref(win->css_provider);
+
+    notes_encoding_free(win);
 
     if (win->file_monitor) {
         g_signal_handlers_disconnect_by_func(win->file_monitor,
@@ -507,8 +670,40 @@ static GtkWidget *build_menu_button(NotesWindow *win) {
 
     GMenu *view_section = g_menu_new();
     g_menu_append(view_section, "Show Whitespace", "win.toggle-whitespace");
+    g_menu_append(view_section, "Highlight Non-ASCII Text", "win.encoding-highlight");
+    g_menu_append(view_section, "Next Non-ASCII", "win.encoding-next");
     g_menu_append_section(menu, NULL, G_MENU_MODEL(view_section));
     g_object_unref(view_section);
+
+    GMenu *enc_section = g_menu_new();
+    g_menu_append(enc_section, "Encoding Info...", "win.encoding-info");
+    g_menu_append(enc_section, "Convert to UTF-8", "win.encoding-convert");
+    g_menu_append(enc_section, "Reload with Encoding...", "win.reload-encoding");
+    g_menu_append(enc_section, "Save As with Encoding...", "win.save-as-encoding");
+    g_menu_append(enc_section, "Fix Mojibake (mis-decoded text)", "win.fix-mojibake");
+    g_menu_append(enc_section, "Replace Lookalikes with ASCII", "win.encoding-asciify");
+
+    GMenu *eol_menu = g_menu_new();
+    g_menu_append(eol_menu, "Unix (LF)", "win.eol-lf");
+    g_menu_append(eol_menu, "Windows (CRLF)", "win.eol-crlf");
+    g_menu_append_submenu(enc_section, "Line Endings", G_MENU_MODEL(eol_menu));
+    g_object_unref(eol_menu);
+
+    GMenu *kind_menu = g_menu_new();
+    for (int cls = 1; cls < NOTES_CHAR_CLASS_COUNT; cls++) {
+        GMenuItem *item = g_menu_item_new(encoding_class_name(cls),
+                                          NULL);
+        g_menu_item_set_action_and_target_value(item, "win.encoding-next-class",
+                                                g_variant_new_int32(cls));
+        g_menu_append_item(kind_menu, item);
+        g_object_unref(item);
+    }
+    g_menu_append_submenu(enc_section, "Next Non-ASCII by Kind",
+                          G_MENU_MODEL(kind_menu));
+    g_object_unref(kind_menu);
+
+    g_menu_append_section(menu, NULL, G_MENU_MODEL(enc_section));
+    g_object_unref(enc_section);
 
     GMenu *ssh_section = g_menu_new();
     g_menu_append(ssh_section, "SFTP Connect...", "win.sftp-connect");
@@ -535,6 +730,10 @@ NotesWindow *notes_window_new(GtkApplication *app) {
     gtk_window_set_default_size(GTK_WINDOW(win->window),
                                 win->settings.window_width,
                                 win->settings.window_height);
+
+    /* Lets main.c find this NotesWindow again when a second launch hands us
+       another file to open. */
+    g_object_set_data(G_OBJECT(win->window), "notes-win", win);
 
     g_signal_connect(win->window, "close-request", G_CALLBACK(on_close_request), win);
     g_signal_connect(win->window, "destroy", G_CALLBACK(on_destroy), win);
@@ -565,7 +764,7 @@ NotesWindow *notes_window_new(GtkApplication *app) {
 
     win->scrollbar_overlay = gtk_drawing_area_new();
     gtk_widget_set_halign(win->scrollbar_overlay, GTK_ALIGN_END);
-    gtk_widget_set_size_request(win->scrollbar_overlay, 6, -1);
+    gtk_widget_set_size_request(win->scrollbar_overlay, 8, -1);
     gtk_widget_set_can_target(win->scrollbar_overlay, FALSE);
     search_init_scrollbar_overlay(win);
     gtk_overlay_add_overlay(GTK_OVERLAY(scroll_overlay), win->scrollbar_overlay);
@@ -619,8 +818,14 @@ NotesWindow *notes_window_new(GtkApplication *app) {
 
     notes_window_apply_settings(win);
 
+    /* The last file is NOT restored here: when the app is started with a
+       file argument, restoring first would load a whole document only to
+       replace it a moment later. main.c calls notes_window_restore_last()
+       only when no file was given. */
+    return win;
+}
+
+void notes_window_restore_last(NotesWindow *win) {
     if (win->settings.last_file[0] != '\0')
         notes_window_load_file(win, win->settings.last_file);
-
-    return win;
 }

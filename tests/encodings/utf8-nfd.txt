@@ -1,0 +1,3 @@
+Príliš žlťučký kôň úpel ďábelské ódy.
+Decomposed (NFD): every accent is a separate combining character.
+Convert to UTF-8 should recompose this to NFC.

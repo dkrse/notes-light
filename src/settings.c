@@ -22,6 +22,10 @@ char *settings_get_config_path(void) {
 }
 
 void settings_load(NotesSettings *s) {
+    /* Zero first: recent_files/recent_count have no explicit default below
+       and the caller must not be relied on to pre-clear the struct. */
+    memset(s, 0, sizeof(*s));
+
     /* defaults */
     strncpy(s->font, "Monospace", sizeof(s->font) - 1);
     s->font_size = 14;
@@ -207,14 +211,15 @@ void settings_save(const NotesSettings *s) {
     ensure_config_dir();
     char *path = settings_get_config_path();
 
-    /* Atomic write: write to tmp, then rename */
+    /* Atomic write: exclusive tmp (O_EXCL via mkstemp), then rename. A
+       predictable name with O_CREAT would follow a symlink planted there. */
     char tmp[1088];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-
-    int fd = g_open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    snprintf(tmp, sizeof(tmp), "%s.XXXXXX", path);
+    int fd = g_mkstemp(tmp);
     if (fd < 0) return;
+    fchmod(fd, 0600);
     FILE *f = fdopen(fd, "w");
-    if (!f) { close(fd); return; }
+    if (!f) { close(fd); g_remove(tmp); return; }
 
     fprintf(f, "font=%s\n", s->font);
     fprintf(f, "font_size=%d\n", s->font_size);

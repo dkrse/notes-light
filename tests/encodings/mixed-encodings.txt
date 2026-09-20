@@ -1,0 +1,4 @@
+Riadok 1 je v UTF-8: PrÃ­liÅ¡ Å¾lÅ¥uÄkÃ½ kÃ´Åˆ.
+Riadok 2 je vo windows-1250: Príliš luèkı kôò.
+Riadok 3 je zase UTF-8: ÄÃ¡belskÃ© Ã³dy ğŸ‰
+Riadok 4 vo windows-1250: meniny má ofia, poèasie je krásne.

@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "editor_view.h"
 #include "theme.h"
+#include "search.h"
+#include "encoding_view.h"
 #include "ssh_window.h"
 #include <string.h>
 
@@ -111,6 +113,11 @@ static gboolean intensity_idle_cb(gpointer data) {
 
 void editor_view_update_dirty_state(NotesWindow *win) {
     if (win->original_content) {
+        /* Fast path: a different character count means the text differs, so
+           skip copying and hashing the whole buffer on every keystroke. */
+        if (gtk_text_buffer_get_char_count(win->buffer) != win->original_chars)
+            goto changed;
+
         GtkTextIter s, e;
         gtk_text_buffer_get_bounds(win->buffer, &s, &e);
         char *text = gtk_text_buffer_get_text(win->buffer, &s, &e, FALSE);
@@ -138,6 +145,7 @@ void editor_view_update_dirty_state(NotesWindow *win) {
         }
     }
 
+changed:
     if (!win->dirty) {
         win->dirty = TRUE;
         if (win->current_file[0]) {
@@ -155,6 +163,8 @@ void editor_view_update_dirty_state(NotesWindow *win) {
 static void on_buffer_changed(GtkTextBuffer *buffer, gpointer data) {
     NotesWindow *win = data;
     editor_view_update_dirty_state(win);
+    search_refresh_after_edit(win);
+    notes_encoding_schedule_refresh(win);
     if (win->settings.show_line_numbers)
         editor_view_update_line_numbers(win);
     editor_view_update_cursor_position(win);
@@ -367,6 +377,14 @@ GtkWidget *editor_view_create(NotesWindow *win) {
     win->search_tag = gtk_text_buffer_create_tag(win->buffer, "search-match",
                                                   "background", "#f0b030",
                                                   "foreground", "#000000", NULL);
+
+    for (int cls = 1; cls < NOTES_CHAR_CLASS_COUNT; cls++) {
+        char tag_name[32];
+        snprintf(tag_name, sizeof(tag_name), "encoding-class-%d", cls);
+        win->encoding_tags[cls] = gtk_text_buffer_create_tag(win->buffer, tag_name,
+            "background", encoding_class_color(cls),
+            "foreground", "#ffffff", NULL);
+    }
 
     win->intensity_tag = gtk_text_buffer_create_tag(win->buffer, "intensity",
                                                      "foreground-rgba", NULL, NULL);

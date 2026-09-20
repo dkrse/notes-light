@@ -1,10 +1,11 @@
 CC = gcc
-CFLAGS = -std=c17 -Wall -Wextra -O2 $(shell pkg-config --cflags libadwaita-1 gtksourceview-5)
+CFLAGS = -std=c17 -Wall -Wextra -O2 -MMD -MP $(shell pkg-config --cflags libadwaita-1 gtksourceview-5)
 LDFLAGS = $(shell pkg-config --libs libadwaita-1 gtksourceview-5)
 
 BUILDDIR = build
 SRC = src/main.c src/window.c src/settings.c src/ssh.c \
       src/theme.c src/editor_view.c src/search.c src/ssh_window.c \
+      src/encoding.c src/encoding_view.c \
       src/actions.c src/actions_file.c src/actions_view.c src/actions_ssh.c
 OBJ = $(patsubst src/%.c,$(BUILDDIR)/%.o,$(SRC))
 BIN = $(BUILDDIR)/notes-light
@@ -22,5 +23,7 @@ $(BUILDDIR):
 
 clean:
 	rm -rf $(BUILDDIR)
+
+-include $(OBJ:.o=.d)
 
 .PHONY: all clean

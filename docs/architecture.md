@@ -23,6 +23,14 @@ src/
                          whitespace drawer, Ctrl+scroll zoom
   search.h / search.c    Find & Replace bar, scrollbar match markers,
                          Go to Line dialog
+  encoding.h / .c        Encoding sniffing (BOM, ASCII, UTF-8, UTF-16/32,
+                         legacy code pages), conversion to UTF-8,
+                         per-character classification, ASCII fold table,
+                         non-ASCII scan, line-ending detection
+  encoding_view.h / .c   Window-side encoding state, status bar text,
+                         non-ASCII highlight tags + navigation, scrollable
+                         Encoding Info window, Convert to UTF-8 /
+                         Replace Lookalikes actions
   ssh_window.h           SSH window-state API
   ssh_window.c           connect / disconnect, open_remote_file,
                          save_remote_file, status button, action gating
@@ -65,7 +73,7 @@ back into action handlers.
 ## Data Flow
 
 ```
-Startup:
+Startup (no file argument):
   main → AdwApplication → on_activate
     → notes_window_new
       → settings_load (incl. recent_files)
@@ -78,8 +86,15 @@ Startup:
       → notes_window_recent_menu_rebuild
       → ssh_window_update_status
       → notes_window_apply_settings (theme + CSS + editor + source style)
-      → notes_window_load_file (restore last file if present)
+    → notes_window_restore_last (last file, only on this path)
     → gtk_window_present
+
+Startup (with a file argument):
+  main → AdwApplication → on_open
+    → reuse the existing window if there is one, else notes_window_new
+    → first file only; the rest are reported and ignored
+    → fresh window   → notes_window_load_file
+      existing one   → notes_window_request_open (asks when dirty)
 
 Editing:
   keystroke → GtkTextBuffer "changed" signal (editor_view.c)
@@ -94,10 +109,21 @@ Editing:
   Ctrl+mouse wheel on text view (editor_view.c) → font_size ±1pt →
     notes_window_apply_settings → settings_save
 
-File Load (local):
+File Load (local) — the hot path, ~80 ms for 5 MB:
   notes_window_load_file
-    → fopen("rb") → fread (max 5 MB) → NUL→'.' → g_utf8_validate
-    → g_convert_with_fallback if needed
+    → fopen("rb") → fread (max 5 MB)
+    → encoding_detect → encoding_to_utf8 (BOM stripped)
+    → NUL→'.' → g_utf8_validate → ISO-8859-1 fallback if still invalid
+    → notes_encoding_set_detected (status bar, EOL, marks)
+
+  What it deliberately does *not* do: copy the decoded text (ownership moves
+  into `original_content` via `notes_set_original_take()`), hash it twice
+  (the disk hash is reused when nothing was transcoded), validate UTF-8
+  again (`known_valid` — the detector or the converter already guarantees
+  it), walk the text for a character count (the buffer knows it), or scan
+  more than 1 MB for line endings. `set_text` runs inside
+  `begin/end_irreversible_action()` with the syntax engine off, so opening a
+  file is not an undo step and is not highlighted up front.
     → notes_apply_source_language → notes_apply_source_style
     → install GFileMonitor for auto-reload
     → editor_view_block_signals → set_text → set state → unblock
@@ -178,8 +204,143 @@ to 5 MB for display. Binary/truncated files are read-only (Save redirects
 to Save As).
 
 ### Binary File Detection
-First 8 KB scanned for NUL bytes. NUL bytes replaced with '.'. Non-UTF-8
-content converted via ISO-8859-1 fallback.
+Detection runs *after* transcoding, so UTF-16 NUL padding no longer looks
+binary. The first 8 KB of the decoded text is scanned for NUL bytes; NULs
+are replaced with '.'. Text that is still not valid UTF-8 after decoding
+falls back to ISO-8859-1 with replacement and is marked binary
+(read-only, Save redirects to Save As).
+
+### Encoding Detection & Conversion
+`encoding_detect()` tries, in order: BOM (UTF-8/16/32), pure ASCII, valid
+UTF-8, BOM-less UTF-16 (NUL-position bias over the first 4 KB), then every
+legacy candidate (windows-1250/1251/1252, ISO-8859-1/2/15, KOI8-R)
+decoded with strict `g_convert`. Each successful decode is scored: letters
+score positive, control/unprintable characters heavily negative, stray
+symbols mildly negative. Two tie-breakers pick the right family — when
+more than half of all letters are non-ASCII the text is probably not
+Latin-script, so Cyrillic output is rewarded; when no Latin Extended-A
+letter appears, Western code pages win. The buffer always holds UTF-8;
+`NotesWindow.file_encoding` keeps the source name for the status bar and
+saving always writes UTF-8 without a BOM.
+
+### Mixed-Encoding Files
+A file can genuinely hold two encodings — a UTF-8 log appended to a
+windows-1250 one, a dump stitched together from two sources. Decoding such
+a file with a single code page destroys the UTF-8 part (`Príliš` becomes
+`PrГ­liЕЎ`), so `encoding_detect()` looks for the combination: `utf8_split()`
+counts valid multi-byte UTF-8 sequences, the bytes that cannot belong to
+any valid sequence, and how many separate stretches those form. If there
+are at least two valid sequences, at least one foreign byte and no NUL
+bytes in the first 8 KB, the file is reported as
+`mixed: UTF-8 + <code page>`.
+
+The code page is picked by running `decode_mixed()` for every candidate and
+scoring the *result* — the foreign bytes keep their ASCII context that way,
+which is what makes the score meaningful on short stretches.
+`decode_mixed()` then walks the buffer: valid UTF-8 sequences are copied
+byte for byte, every run of foreign bytes is converted on its own with
+`g_convert_with_fallback`. The buffer therefore always ends up in exactly
+one encoding, and saving writes the file back as single-encoding UTF-8.
+
+### Character Classes Inside a UTF-8 Document
+Once a document is UTF-8, "which characters are ASCII and which are not" is
+a property of each character, not of the file: everything below U+0080 is a
+single byte, everything else is a 2-4 byte sequence.
+`encoding_classify()` sorts every character into one of six classes, and
+`encoding_scan_nonascii()` returns runs that break whenever the class
+changes:
+
+| Class | Examples | Color |
+|-------|----------|-------|
+| ASCII | `A`, `,`, space | not tagged |
+| Accented Latin | á ž ô ü (U+00C0-U+024F, U+1E00-U+1EFF) | green `#27ae60` |
+| Typographic lookalike | curly quotes, – — …, NBSP | orange `#d35400` |
+| Invisible / control | zero-width, soft hyphen, U+FEFF, Cc/Cf | red `#c0392b` |
+| Other script | Cyrillic, Greek, CJK letters | blue `#2980b9` |
+| Symbol / emoji | 🎉, math and box-drawing symbols | purple `#8e44ad` |
+| Combining mark | NFD accents (`i` + U+0301) | teal `#16a085` |
+
+While the highlight is on, `notes_encoding_refresh_marks()` also totals the
+characters (and the invisible ones separately) into
+`enc_nonascii_total` / `enc_invisible_total`, which
+`notes_encoding_update_status()` appends to the status bar. Edits schedule a
+rescan via `notes_encoding_schedule_refresh()` — an idle callback, so a
+burst of typing triggers one scan rather than one per keystroke.
+
+A combining mark has zero advance width — it is drawn onto the character
+before it — so tagging only the mark paints nothing visible. A run of
+combining marks therefore also covers the ASCII base character in front of
+it, and `NotesEncodingSpan.nonascii` records how many characters in the run
+really are non-ASCII, so counts stay honest while the highlight stays
+visible.
+
+One `GtkTextTag` per class is created in `editor_view_create`
+(`encoding-class-N`). `win.encoding-highlight` applies them,
+`win.encoding-next` (Ctrl+Shift+E) cycles through the runs and turns the
+highlight on if it is off.
+
+`win.encoding-convert` re-emits the buffer through
+`g_utf8_normalize(NFC)`, drops stray U+FEFF characters and marks the
+document dirty, so "convert the whole document to UTF-8" does something
+concrete even for a file that was already UTF-8. It then runs
+`encoding_report()` over the result — `g_utf8_validate` plus counts of
+ASCII / multi-byte / U+FFFD / invisible / lookalike characters — and
+reports what the document now holds. The wording is deliberate: a
+document can only be in *one* encoding, so after the conversion the
+report says so, and explains that the remaining highlighted characters are
+UTF-8 as well (UTF-8 simply spends 2-4 bytes on them) rather than leftovers
+of another encoding.
+
+Note the aliasing trap in that handler: the "source encoding" shown in the
+report must be *copied* out of `win->file_encoding` before the field is
+overwritten with `"UTF-8"`, otherwise the report prints the new value.
+`win.encoding-asciify` applies `encoding_asciify_punctuation()`, which
+folds the lookalike table (quotes, dashes, spaces, ellipsis) to ASCII and
+removes zero-width/soft-hyphen characters. Both replace the buffer via
+`encoding_replace_buffer()`, which preserves the cursor line/column.
+
+### Forcing an Encoding, Saving in Another One
+`encoding_detect()` is a heuristic, so `win.reload-encoding` lets the user
+overrule it: `encoding_force()` fills a `NotesEncodingInfo` for the chosen
+charset (stripping a BOM that belongs to it, via `encoding_bom_length()`)
+and `notes_window_load_file_as()` re-reads the file and decodes it with
+that. `notes_window_load_file()` is now a thin wrapper that passes NULL.
+
+The reverse direction is `win.save-as-encoding`: the buffer stays UTF-8 and
+`encoding_from_utf8()` produces the bytes for the file, prepending a BOM
+for the BOM variants. `g_convert` is used in strict mode on purpose — if
+the target encoding cannot represent a character, the save is refused with
+a dialog rather than writing `?` in place of the user's text.
+
+### Mojibake Repair
+Mojibake is UTF-8 that was decoded once as a single-byte code page, so the
+original bytes survive one-per-character. `encoding_fix_mojibake()` walks
+the suspects (cp1252, cp1250, latin-1, cp1251, iso-8859-2), re-encodes the
+text into each and keeps a candidate only when the recovered bytes are
+valid UTF-8 with no foreign bytes, contain multi-byte sequences, hold no
+control or unassigned characters, and reduce the non-ASCII count — mojibake
+always inflates one character into two or three, so a genuine repair always
+shrinks that count. Healthy text fails every test and is returned
+unchanged.
+
+### Encoding Info Window
+`win.encoding-info` builds a plain `GtkWindow` (620x620, `AdwHeaderBar`,
+`GtkScrolledWindow`) instead of a `GtkAlertDialog`, because the content
+grew past what an alert can show: File / Encoding key-value grids, the
+color legend for all six character classes (chip + hex + description +
+examples + counts), and a `GtkListBox` of up to 200 individual non-ASCII
+characters. Each list row carries an `InfoJump` (character offset) as
+object data; `row-activated` moves the cursor and scrolls the text view,
+and the window is non-modal so it can stay open while navigating.
+
+### UTF-8 Is the Only Thing That Gets Written
+A `GtkTextBuffer` can hold nothing but UTF-8, so by the time a document is
+in the editor it is single-encoding no matter what the file on disk was.
+`save_text_utf8()` makes that a checked guarantee rather than an
+assumption: it validates the text, writes exactly `strlen` bytes and never
+prepends a BOM. Save, Save As and the conversion actions all funnel
+through it, and `notes_encoding_mark_utf8()` resets the recorded encoding
+state afterwards so the status bar stops showing the old source encoding.
 
 ### Atomic Writes
 All file writes (content, settings, connection profiles) use exclusive
@@ -227,6 +388,12 @@ applied as CSS opacity on the text view widget (preserving syntax
 colors). Re-applied after file load and on buffer changes via idle
 callback.
 
+### Scrollbar Markers
+The `scrollbar_overlay` drawing area carries two kinds of marks: non-ASCII
+spans in their class colors on the left half, search hits in orange on the
+right half. Both are drawn from `draw_scrollbar_markers()` in `search.c`,
+which is also queued for redraw from `notes_encoding_refresh_marks()`.
+
 ### Search with Scrollbar Markers
 Search highlights all matches with a `GtkTextTag`. Match line numbers and
 byte offsets are collected during the highlight pass. Navigation uses
@@ -237,9 +404,13 @@ window.
 
 ### Auto-reload (file monitor)
 A `GFileMonitor` is installed on the currently open local file in
-`notes_window_load_file`. On a change event we re-read the file and
-compute its FNV-1a hash; if it matches `original_hash` we ignore the
-event (it's the result of our own atomic save). Otherwise:
+`notes_window_load_file`. On a change event at most `MAX_DISPLAY_BYTES`
+of raw bytes are read and hashed; if the hash matches `disk_hash` — the
+hash of the bytes we last read from or wrote to disk — the event is
+ignored as our own write. `disk_hash` is deliberately separate from
+`original_hash`, which covers the *decoded* buffer text: comparing raw
+file bytes against it never matched for a file that needed transcoding,
+so every save of such a file looked like an external change. Otherwise:
 - buffer is clean → silent reload via `reload_keep_cursor`, which saves
   the cursor's line/col before `load_file` and restores it after,
   clamped to the new line/column count;
@@ -297,14 +468,42 @@ connect. Remote file paths use a virtual mount prefix
 detection.
 
 ### Remote File Save
-Uses `ssh tee remote_path` with content piped via GSubprocess stdin.
-Binary-safe.
+`ssh_remote_write_command()` builds the remote shell command and content is
+piped in over GSubprocess stdin. The command is atomic and quoted:
+
+```sh
+if [ -e 'dst' ]; then cp -p -- 'dst' 'dst.notes-light-tmp' 2>/dev/null; fi
+cat > 'dst.notes-light-tmp' && mv -f -- 'dst.notes-light-tmp' 'dst' \
+  || { rm -f -- 'dst.notes-light-tmp'; exit 1; }
+```
+
+Two things matter here. `cat > file` truncates before the first byte
+arrives, so a dropped connection used to leave the remote file half
+written — the temporary plus rename makes the replacement atomic, matching
+the local save path, and the `cp -p` carries the original's permissions
+across. And every path is `g_shell_quote()`d: `ssh host -- cmd args` hands
+the whole command to the remote *login shell*, so `--` protects the local
+option parser only; an unquoted name like `a; rm -rf ~` would run as a
+command on the server. The same quoting applies to `cat` when reading and
+to `ls` in the browser.
+
+Closing a dirty remote document goes through `save_remote_file()` as well:
+its virtual mount path does not exist on the local disk, so a local write
+would fail silently and throw the changes away.
 
 ### Connection Profiles
 Saved in `~/.config/notes-light/connections.conf` (INI format, 0600
 permissions). Passwords are never saved — only key paths are persisted.
 
 ### Smart Dirty Detection
+The character count is compared first (`gtk_text_buffer_get_char_count()`
+against `original_chars`): typing or deleting changes it, so the common
+case costs O(1) and never copies the buffer. Only when the counts match
+does the FNV-1a hash of the full text run, and only on a hash match the
+`strcmp`. `notes_set_original()` is the single place that stores
+`original_content` with its hash and character count.
+
+### Smart Dirty Detection (historical note)
 `editor_view_update_dirty_state` uses FNV-1a 32-bit hash to quickly
 detect whether the buffer has changed. On each keystroke, the current
 buffer is hashed and compared with `original_hash`. Only when hashes
@@ -335,6 +534,9 @@ Central state object, heap-allocated via `g_new0`. Holds:
 - CSS provider
 - File state (current_file path, dirty flag, is_binary, is_truncated,
   original_content, original_hash)
+- Encoding state (file_encoding, file_eol, status_extra, encoding_converted,
+  encoding_confidence, encoding_tag, encoding_marks_shown, enc_spans/count/
+  current)
 - Idle source IDs (line_numbers, intensity, scroll, title)
 - Current line highlight state (line number, RGBA color)
 - Tags (intensity_tag, search_tag)

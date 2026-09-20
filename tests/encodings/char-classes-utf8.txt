@@ -1,0 +1,61 @@
+CHARACTER CLASS TEST DOCUMENT
+=============================
+
+This whole file is ONE encoding: UTF-8. Nothing in it is in another
+encoding, so "Convert to UTF-8" has almost nothing to do here and saving
+it produces the same bytes - that is the correct result.
+(The one exception: section 4 hides a stray BOM character, which Convert
+to UTF-8 removes - the file shrinks by 3 bytes.)
+
+For a file that really does hold two encodings at once, use
+mixed-encodings.txt instead.
+
+Every line below is labelled with what the app should report for it.
+Turn on: menu -> Highlight Non-ASCII Text, then walk the file with
+Ctrl+Shift+E (Next Non-ASCII).
+
+0. ALL FIVE COLORS ON ONE LINE (quick check)
+   ASCII abc | accent ážô | lookalike “quotes” – … | invisible ​­ | script Привет Καλή | symbol 🎉 → ∑
+   If you only see green here, the highlight is off or the build is stale.
+
+1. ASCII only .......... nothing highlighted
+   The quick brown fox jumps over the lazy dog, 0123456789 !?#$%&*()
+   'straight quotes', "double quotes", a - hyphen, three dots ...
+
+2. Accented Latin ...... GREEN
+   Prilis zlty kon becomes: Prížliš žltý kôň úpel ďábelské ódy
+   German: Grüße aus München. French: café, naïve, façade.
+   Polish: zażółć gęślą jaźń.
+
+3. Typographic lookalikes ...... ORANGE
+   These four “look” like ASCII but are not: “quotes”, ‘apostrophe’,
+   en dash – and em dash —, ellipsis …, bullet •, fraction slash ⁄.
+   The next two words are separated by a NO-BREAK space: here they are.
+   French quotes: «guillemets», multiplication sign 3×4.
+
+4. Invisible / control ...... RED
+   There is a zero-width space between these​words.
+   Soft hyphen inside a word: exa­mple.
+   A stray byte order mark follows this colon:﻿
+   Zero-width non-joiner‌ and joiner‍ are here too.
+
+5. Other scripts ...... BLUE
+   Cyrillic: Привет мир, как дела?
+   Greek: Καλημέρα κόσμε.
+   Japanese: こんにちは世界.
+   Homoglyph trap - this looks like Latin "A" but is Cyrillic: АВСЕ.
+
+6. Symbols / emoji ...... PURPLE
+   Party 🎉 rocket 🚀 check ✔ arrows → ⇒ math ∑ ∞ ≤
+   Box drawing: ┌──┐ currency: € £ ¥ ₴
+
+WHAT TO TRY
+-----------
+* Encoding Info...            -> counts per class, first occurrence Ln/Col
+* Highlight Non-ASCII Text    -> the five colors above
+* Next Non-ASCII (Ctrl+Shift+E)
+* Replace Lookalikes with ASCII -> section 3 and 4 collapse to plain ASCII,
+  sections 2, 5 and 6 stay untouched
+* Convert to UTF-8            -> normalizes to NFC, drops the stray BOM in
+  section 4, marks the document dirty
+* Save                        -> status bar goes back to plain UTF-8

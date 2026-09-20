@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "ssh_window.h"
+#include "encoding_view.h"
 #include "ssh.h"
 #include "editor_view.h"
 #include "theme.h"
@@ -70,10 +71,22 @@ void notes_window_open_remote_file(NotesWindow *win, const char *remote_path) {
     char *contents = NULL;
     gsize len = 0;
 
+    gboolean too_large = FALSE;
     if (!ssh_cat_file(win->ssh_host, win->ssh_user, win->ssh_port,
                       win->ssh_key, win->ssh_ctl_path,
-                      remote_path, &contents, &len, 5 * 1024 * 1024)) {
+                      remote_path, &contents, &len, 5 * 1024 * 1024,
+                      &too_large)) {
         return;
+    }
+
+    NotesEncodingInfo enc;
+    encoding_detect(contents, len, &enc);
+
+    char *raw = contents;
+    if (!enc.is_utf8 || enc.has_bom) {
+        gsize conv_len = 0;
+        char *utf8 = encoding_to_utf8(contents, len, &enc, &conv_len);
+        if (utf8) { contents = utf8; len = conv_len; }
     }
 
     gboolean is_binary = FALSE;
@@ -91,18 +104,23 @@ void notes_window_open_remote_file(NotesWindow *win, const char *remote_path) {
         gsize bw = 0;
         char *utf8 = g_convert_with_fallback(contents, (gssize)len,
                          "UTF-8", "ISO-8859-1", ".", NULL, &bw, NULL);
-        if (utf8) { g_free(contents); contents = utf8; len = bw; }
+        if (utf8) {
+            if (contents != raw) g_free(contents);
+            contents = utf8;
+            len = bw;
+        }
     }
 
     editor_view_block_signals(win);
 
     gtk_text_buffer_set_text(win->buffer, contents, (int)len);
 
-    g_free(win->original_content);
-    win->original_content = contents;
-    win->original_hash = fnv1a_hash(contents, len);
+    notes_set_original(win, g_strndup(contents, len));
     win->is_binary = is_binary;
-    win->is_truncated = FALSE;
+    /* Too large to load: the buffer holds a notice, not the file. Marking it
+       truncated makes Save redirect to Save As, so the remote file can never
+       be overwritten with the placeholder. */
+    win->is_truncated = too_large;
     win->dirty = FALSE;
 
     snprintf(win->current_file, sizeof(win->current_file), "%s%s",
@@ -126,9 +144,11 @@ void notes_window_open_remote_file(NotesWindow *win, const char *remote_path) {
     editor_view_update_line_highlights(win);
     editor_view_apply_font_intensity(win);
 
-    char status[128];
-    snprintf(status, sizeof(status), "UTF-8 | %s | remote", is_binary ? "BIN" : "TEXT");
-    gtk_label_set_text(win->status_encoding, status);
+    notes_encoding_set_detected(win, &enc, contents, len,
+                                too_large ? "remote, too large to load (read-only)"
+                                          : "remote");
+    if (contents != raw) g_free(contents);
+    g_free(raw);
 }
 
 gboolean save_remote_file(NotesWindow *win) {
@@ -149,9 +169,7 @@ gboolean save_remote_file(NotesWindow *win) {
                                   remote, text, len);
 
     if (ok) {
-        g_free(win->original_content);
-        win->original_content = text;
-        win->original_hash = fnv1a_hash(text, len);
+        notes_set_original(win, text);
         win->dirty = FALSE;
 
         char *base = g_path_get_basename(remote);

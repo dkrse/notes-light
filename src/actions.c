@@ -1,5 +1,6 @@
 #include "actions_internal.h"
 #include "editor_view.h"
+#include "encoding_view.h"
 
 static void on_toggle_whitespace(GSimpleAction *action, GVariant *param, gpointer data) {
     (void)param;
@@ -32,6 +33,16 @@ void actions_setup(NotesWindow *win, GtkApplication *app) {
         {"redo",            on_redo,           NULL, NULL, NULL, {0}},
         {"print",           on_print,          NULL, NULL, NULL, {0}},
         {"open-recent",     on_open_recent,    "s",  NULL, NULL, {0}},
+        {"encoding-convert", on_encoding_convert, NULL, NULL, NULL, {0}},
+        {"encoding-next",    on_encoding_next,    NULL, NULL, NULL, {0}},
+        {"encoding-info",    on_encoding_info,    NULL, NULL, NULL, {0}},
+        {"encoding-asciify", on_encoding_asciify, NULL, NULL, NULL, {0}},
+        {"reload-encoding",  on_encoding_reload_as, NULL, NULL, NULL, {0}},
+        {"save-as-encoding", on_encoding_save_as,  NULL, NULL, NULL, {0}},
+        {"fix-mojibake",     on_encoding_fix_mojibake, NULL, NULL, NULL, {0}},
+        {"eol-lf",           on_encoding_eol,      NULL, NULL, NULL, {0}},
+        {"eol-crlf",         on_encoding_eol,      NULL, NULL, NULL, {0}},
+        {"encoding-next-class", on_encoding_next_class, "i", NULL, NULL, {0}},
     };
     g_action_map_add_action_entries(G_ACTION_MAP(win->window),
                                    win_entries, G_N_ELEMENTS(win_entries), win);
@@ -42,6 +53,13 @@ void actions_setup(NotesWindow *win, GtkApplication *app) {
     g_signal_connect(ws, "activate", G_CALLBACK(on_toggle_whitespace), win);
     g_action_map_add_action(G_ACTION_MAP(win->window), G_ACTION(ws));
     g_object_unref(ws);
+
+    /* Stateful toggle for the non-ASCII / converted-text highlight */
+    GSimpleAction *enc = g_simple_action_new_stateful("encoding-highlight", NULL,
+        g_variant_new_boolean(FALSE));
+    g_signal_connect(enc, "activate", G_CALLBACK(on_encoding_highlight), win);
+    g_action_map_add_action(G_ACTION_MAP(win->window), G_ACTION(enc));
+    g_object_unref(enc);
 
     const char *zoom_in_accels[]  = {"<Control>plus", "<Control>equal", NULL};
     const char *zoom_out_accels[] = {"<Control>minus", NULL};
@@ -56,6 +74,7 @@ void actions_setup(NotesWindow *win, GtkApplication *app) {
     const char *print_accels[]    = {"<Control>p", NULL};
     const char *undo_accels[]     = {"<Control>z", NULL};
     const char *redo_accels[]     = {"<Control><Shift>z", "<Control>y", NULL};
+    const char *enc_next_accels[] = {"<Control><Shift>e", NULL};
 
     gtk_application_set_accels_for_action(app, "win.find",         find_accels);
     gtk_application_set_accels_for_action(app, "win.find-replace", replace_accels);
@@ -70,4 +89,5 @@ void actions_setup(NotesWindow *win, GtkApplication *app) {
     gtk_application_set_accels_for_action(app, "win.print",        print_accels);
     gtk_application_set_accels_for_action(app, "win.undo",         undo_accels);
     gtk_application_set_accels_for_action(app, "win.redo",         redo_accels);
+    gtk_application_set_accels_for_action(app, "win.encoding-next", enc_next_accels);
 }

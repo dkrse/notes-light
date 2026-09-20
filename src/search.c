@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "search.h"
 #include "theme.h"
+#include "encoding.h"
 #include <adwaita.h>
 #include <stdlib.h>
 #include <string.h>
@@ -118,6 +119,7 @@ static void on_replace_one(GtkWidget *widget, gpointer data) {
     (void)widget;
     NotesWindow *win = data;
     if (win->match_count == 0 || win->match_current < 0) return;
+    win->search_busy = TRUE;
 
     const char *find = gtk_editable_get_text(GTK_EDITABLE(win->search_entry));
     const char *repl = gtk_editable_get_text(GTK_EDITABLE(win->replace_entry));
@@ -129,6 +131,7 @@ static void on_replace_one(GtkWidget *widget, gpointer data) {
         gtk_text_buffer_insert(win->buffer, &sel_start, repl, -1);
     }
 
+    win->search_busy = FALSE;
     search_highlight_all(win);
     if (win->match_count > 0) {
         if (win->match_current >= win->match_count)
@@ -150,6 +153,7 @@ static void on_replace_all(GtkWidget *widget, gpointer data) {
 
     int replaced = 0;
     GtkTextIter ms, me;
+    win->search_busy = TRUE;
     gtk_text_buffer_begin_user_action(win->buffer);
     while (gtk_text_iter_forward_search(&start, find,
                GTK_TEXT_SEARCH_CASE_INSENSITIVE, &ms, &me, NULL)) {
@@ -159,6 +163,7 @@ static void on_replace_all(GtkWidget *widget, gpointer data) {
         replaced++;
     }
     gtk_text_buffer_end_user_action(win->buffer);
+    win->search_busy = FALSE;
 
     search_highlight_all(win);
 
@@ -171,10 +176,29 @@ static void draw_scrollbar_markers(GtkDrawingArea *area, cairo_t *cr,
                                     int width, int height, gpointer data) {
     (void)area;
     NotesWindow *win = data;
-    if (win->match_count == 0) return;
 
     int total_lines = gtk_text_buffer_get_line_count(win->buffer);
     if (total_lines <= 0) return;
+
+    /* Non-ASCII marks first, each in its class color, so the whole document
+       can be surveyed without scrolling. Search hits draw on top. */
+    if (win->encoding_marks_shown && win->enc_span_count > 0) {
+        for (int i = 0; i < win->enc_span_count; i++) {
+            GtkTextIter it;
+            gtk_text_buffer_get_iter_at_offset(win->buffer, &it,
+                                               win->enc_spans[i].start);
+            GdkRGBA rgba;
+            if (!gdk_rgba_parse(&rgba, encoding_class_color(win->enc_spans[i].cls)))
+                continue;
+            cairo_set_source_rgba(cr, rgba.red, rgba.green, rgba.blue, 0.9);
+            double y = ((double)gtk_text_iter_get_line(&it) / total_lines) * height;
+            /* half width, left edge — leaves the right half to search hits */
+            cairo_rectangle(cr, 0, y, width / 2.0, 2.0);
+            cairo_fill(cr);
+        }
+    }
+
+    if (win->match_count == 0) return;
 
     if (notes_is_dark_theme(win->settings.theme))
         cairo_set_source_rgba(cr, 1.0, 0.7, 0.2, 0.9);
@@ -184,7 +208,7 @@ static void draw_scrollbar_markers(GtkDrawingArea *area, cairo_t *cr,
     double marker_h = 2.0;
     for (int i = 0; i < win->match_count; i++) {
         double y = ((double)win->match_lines[i] / total_lines) * height;
-        cairo_rectangle(cr, 0, y, width, marker_h);
+        cairo_rectangle(cr, width / 2.0, y, width / 2.0, marker_h);
         cairo_fill(cr);
     }
 }
@@ -282,6 +306,22 @@ GtkWidget *search_build_bar(NotesWindow *win) {
 void search_init_scrollbar_overlay(NotesWindow *win) {
     gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(win->scrollbar_overlay),
                                     draw_scrollbar_markers, win, NULL);
+}
+
+void search_refresh_after_edit(NotesWindow *win) {
+    /* Replace All edits the buffer many times; re-highlighting after each
+       single replacement would make it O(n^2). */
+    if (win->search_busy) return;
+    if (!win->search_bar || !gtk_widget_get_visible(win->search_bar)) return;
+
+    const char *text = gtk_editable_get_text(GTK_EDITABLE(win->search_entry));
+    if (!text || text[0] == '\0') return;
+
+    int keep = win->match_current;
+    search_highlight_all(win);
+    if (win->match_count > 0)
+        win->match_current = keep < win->match_count ? keep : 0;
+    search_update_label(win);
 }
 
 void search_show(NotesWindow *win, gboolean with_replace) {

@@ -94,7 +94,8 @@ void notes_apply_source_language(NotesWindow *win, const char *path) {
     static gboolean paths_set = FALSE;
     if (!paths_set) {
         const gchar * const *old = gtk_source_language_manager_get_search_path(lm);
-        GPtrArray *dirs = g_ptr_array_new();
+        /* strings are g_strdup'ed below; the manager copies them */
+        GPtrArray *dirs = g_ptr_array_new_with_free_func(g_free);
 
         char exe_dir[1024];
         ssize_t n = readlink("/proc/self/exe", exe_dir, sizeof(exe_dir) - 1);

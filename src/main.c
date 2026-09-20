@@ -15,6 +15,7 @@ static gboolean restore_title_cb(gpointer data) {
 static void on_activate(GtkApplication *app, gpointer user_data) {
     (void)user_data;
     NotesWindow *win = notes_window_new(app);
+    notes_window_restore_last(win);
     gtk_window_present(GTK_WINDOW(win->window));
 
     /* Re-set title after present — GTK/Adw theme changes can clear it */
@@ -22,20 +23,44 @@ static void on_activate(GtkApplication *app, gpointer user_data) {
         win->title_idle_id = g_idle_add(restore_title_cb, win);
 }
 
+/* One document per window, one window per instance: reuse the existing
+   window (a second launch is routed here by GApplication) and load only the
+   first file given. */
 static void on_open(GApplication *app, GFile **files, gint n_files,
                     const gchar *hint, gpointer user_data) {
     (void)hint; (void)user_data;
-    for (gint i = 0; i < n_files; i++) {
-        NotesWindow *win = notes_window_new(GTK_APPLICATION(app));
-        char *path = g_file_get_path(files[i]);
-        if (path) {
-            notes_window_load_file(win, path);
-            g_free(path);
-        }
-        gtk_window_present(GTK_WINDOW(win->window));
-        if (win->current_file[0] != '\0')
-            win->title_idle_id = g_idle_add(restore_title_cb, win);
+    if (n_files < 1) return;
+
+    GList *windows = gtk_application_get_windows(GTK_APPLICATION(app));
+    NotesWindow *win = windows
+        ? g_object_get_data(G_OBJECT(windows->data), "notes-win")
+        : NULL;
+
+    gboolean fresh = (win == NULL);
+    if (fresh)
+        win = notes_window_new(GTK_APPLICATION(app));
+
+    char *path = g_file_get_path(files[0]);
+
+    if (n_files > 1) {
+        char *base = path ? g_path_get_basename(path) : g_strdup("the first file");
+        g_printerr("notes-light: one document at a time — opening %s, "
+                   "ignoring %d more\n", base, n_files - 1);
+        g_free(base);
     }
+
+    gtk_window_present(GTK_WINDOW(win->window));
+
+    if (path) {
+        if (fresh)
+            notes_window_load_file(win, path);   /* nothing to lose yet */
+        else
+            notes_window_request_open(win, path);
+        g_free(path);
+    }
+
+    if (win->current_file[0] != '\0')
+        win->title_idle_id = g_idle_add(restore_title_cb, win);
 }
 
 static void on_quit(GSimpleAction *action, GVariant *param, gpointer app) {

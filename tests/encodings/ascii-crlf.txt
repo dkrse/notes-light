@@ -1,0 +1,3 @@
+Plain ASCII only.
+No byte above 0x7F on any line.
+Status bar should read: ASCII | TEXT | CRLF

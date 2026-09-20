@@ -14,8 +14,14 @@ gboolean ssh_path_is_remote(const char *path) {
 
 const char *ssh_to_remote_path(const char *ssh_mount, const char *ssh_remote_path,
                                const char *local_path, char *buf, size_t buflen) {
-    size_t mlen = strlen(ssh_mount);
-    const char *suffix = local_path + mlen;
+    /* Without this check a local_path that does not actually start with the
+       mount prefix (different PID or user in the virtual path) would make
+       `local_path + mlen` point past the end of the string. */
+    if (!g_str_has_prefix(local_path, ssh_mount)) {
+        snprintf(buf, buflen, "%s", local_path);
+        return buf;
+    }
+    const char *suffix = local_path + strlen(ssh_mount);
     snprintf(buf, buflen, "%s%s", ssh_remote_path, suffix);
     return buf;
 }
@@ -156,11 +162,17 @@ gboolean ssh_cat_file(const char *host, const char *user, int port,
                       const char *key, const char *ctl_path,
                       const char *remote_path,
                       char **out_contents, gsize *out_len,
-                      gsize max_file_size) {
+                      gsize max_file_size,
+                      gboolean *out_too_large) {
+    if (out_too_large) *out_too_large = FALSE;
+
     GPtrArray *av = ssh_argv_new(host, user, port, key, ctl_path);
     g_ptr_array_add(av, g_strdup("--"));
-    g_ptr_array_add(av, g_strdup("cat"));
-    g_ptr_array_add(av, g_strdup(remote_path));
+    /* One argv element: ssh hands the remote command to the login shell, so
+       the path must be quoted for that shell, not just for exec. */
+    char *quoted = g_shell_quote(remote_path);
+    g_ptr_array_add(av, g_strdup_printf("cat -- %s", quoted));
+    g_free(quoted);
     g_ptr_array_add(av, NULL);
 
     GError *err = NULL;
@@ -191,7 +203,12 @@ gboolean ssh_cat_file(const char *host, const char *user, int port,
     if (len > max_file_size) {
         g_bytes_unref(stdout_bytes);
         g_object_unref(proc);
-        *out_contents = g_strdup("(file too large)");
+        /* Hand back a placeholder, but say so: the caller must not treat
+           this as the file's content and must never write it back. */
+        if (out_too_large) *out_too_large = TRUE;
+        *out_contents = g_strdup_printf(
+            "(file is larger than %lu MB and was not loaded)\n",
+            (unsigned long)(max_file_size / (1024 * 1024)));
         *out_len = strlen(*out_contents);
         return TRUE;
     }
@@ -208,15 +225,38 @@ gboolean ssh_cat_file(const char *host, const char *user, int port,
 
 /* ── Remote file writing ── */
 
+/* Build the remote shell command for an atomic, quoted write.
+   `cat > file` truncates first, so a connection that dies mid-transfer
+   leaves the remote file half written. Writing to a temporary next to the
+   target and renaming makes the replacement atomic, exactly like the local
+   save path. `cp -p` first, when the file exists, carries the permissions
+   and timestamps over to the temporary so the rename does not reset them.
+   Both paths are shell-quoted: ssh concatenates the remote command and the
+   login shell parses it, so an unquoted name like `a; rm -rf ~` would run. */
+char *ssh_remote_write_command(const char *remote_path) {
+    char *tmp_path = g_strdup_printf("%s.notes-light-tmp", remote_path);
+    char *q_dst = g_shell_quote(remote_path);
+    char *q_tmp = g_shell_quote(tmp_path);
+
+    char *cmd = g_strdup_printf(
+        "if [ -e %s ]; then cp -p -- %s %s 2>/dev/null; fi; "
+        "cat > %s && mv -f -- %s %s || { rm -f -- %s; exit 1; }",
+        q_dst, q_dst, q_tmp,
+        q_tmp, q_tmp, q_dst, q_tmp);
+
+    g_free(q_dst);
+    g_free(q_tmp);
+    g_free(tmp_path);
+    return cmd;
+}
+
 gboolean ssh_write_file(const char *host, const char *user, int port,
                         const char *key, const char *ctl_path,
                         const char *remote_path,
                         const char *content, gsize len) {
     GPtrArray *av = ssh_argv_new(host, user, port, key, ctl_path);
     g_ptr_array_add(av, g_strdup("--"));
-    /* Use tee to write stdin to remote file, discard stdout */
-    g_ptr_array_add(av, g_strdup("tee"));
-    g_ptr_array_add(av, g_strdup(remote_path));
+    g_ptr_array_add(av, ssh_remote_write_command(remote_path));
     g_ptr_array_add(av, NULL);
 
     GError *err = NULL;
